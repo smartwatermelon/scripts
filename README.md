@@ -88,7 +88,7 @@ Internal repo; not intended for public consumption.
 - `docs/plans/` — design docs and specs for non-trivial scripts.
 - `tests/` — `bats` test suites and fixtures (`ssh-wrapper.bats`).
 - `LaunchAgents/` — placeholder only; active plists live in `~/Developer/LaunchAgents/`.
-- `.github/workflows/` — `claude.yml`, `claude-blocking-review.yml`, `dependabot-auto-merge.yml` (PR-review automation and dependabot auto-merge). Scheduled ralph-burndown automation moved to a LaunchAgent on mimolette.local.
+- `.github/workflows/` — `claude-blocking-review.yml`, `dependabot-auto-merge.yml` (PR-review automation and dependabot auto-merge). Scheduled ralph-burndown automation moved to a LaunchAgent on mimolette.local.
 
 ## Standards
 
