@@ -1,0 +1,7 @@
+Host mimolette
+  # op: OP_SERVICE_ACCOUNT_TOKEN="op://Personal/mimolette/credential"
+  SendEnv OP_SERVICE_ACCOUNT_TOKEN
+  HostName mimolette.local
+
+Host unannotated
+  HostName unannotated.local

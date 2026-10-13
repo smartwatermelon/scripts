@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_DIR="${HOME}"
+MAXDEPTH=3
+
+# Temporary files for results
+TMP_OUT=$(mktemp)
+TMP_CURRENT=$(mktemp)
+
+# Get global gitignore patterns
+GLOBAL_GITIGNORE=$(git config --get core.excludesfile)
+
+# Read global ignore patterns into an array
+IGNORE_PATTERNS=()
+if [[ -f "${GLOBAL_GITIGNORE}" ]]; then
+  while IFS= read -r pattern; do
+    [[ -z "${pattern}" || "${pattern}" =~ ^# ]] && continue
+    IGNORE_PATTERNS+=("${pattern}")
+  done <"${GLOBAL_GITIGNORE}"
+fi
+
+# Normalize path (removes double slashes, resolves symlinks)
+normalize_path() {
+  local path="$1"
+  realpath "${path}"
+}
+
+# Check if basename matches any global ignore pattern
+is_ignored() {
+  local name="$1"
+  for pattern in "${IGNORE_PATTERNS[@]}"; do
+    [[ "${name}" == "${pattern}" ]] && return 0
+  done
+  return 1
+}
+
+# Recursive directory traversal
+process_dir() {
+  local dir="$1"
+  local depth="$2"
+
+  ((depth > MAXDEPTH)) && return
+
+  dir=$(normalize_path "${dir}")
+
+  # Stop if this directory is a Git repo
+  if [[ -d "${dir}/.git" ]] && git -C "${dir}" rev-parse --is-inside-work-tree &>/dev/null; then
+    if git -C "${dir}" status --porcelain | grep -q .; then
+      echo "❌ ${dir}/ has changes" >>"${TMP_OUT}"
+    else
+      echo "✅ ${dir}/ is up to date" >>"${TMP_CURRENT}"
+    fi
+    return
+  fi
+
+  # Loop over subdirectories
+  for sub in "${dir}"/*; do
+    [[ -d "${sub}" ]] || continue
+    sub_name=$(basename "${sub}")
+    is_ignored "${sub_name}" && continue
+    process_dir "${sub}" $((depth + 1))
+  done
+}
+
+# Start traversal
+process_dir "${BASE_DIR}" 1
+
+# Print summary
+echo "=== Repositories with changes ==="
+cat "${TMP_OUT}"
+echo
+echo "=== Up-to-date repositories ==="
+cat "${TMP_CURRENT}"
+
+# Cleanup
+rm "${TMP_OUT}" "${TMP_CURRENT}"

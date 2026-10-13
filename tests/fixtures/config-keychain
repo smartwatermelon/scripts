@@ -1,0 +1,27 @@
+Host *
+  # op-keychain: op://shared/keychain/password
+
+Host *.internal
+  # op-keychain: op://internal/keychain/password
+
+Host mimolette asiago
+  # op-keychain: op://specific/keychain/password
+
+Host duplicate
+  # op-keychain: op://first/value
+
+Host duplicate
+  # op-keychain: op://second/value
+
+Host quoted
+  # op-keychain: "op://quoted/keychain/password"
+
+Host unannotated
+  HostName unannotated.local
+
+Host mixed
+  # op: TOKEN=op://mixed/token
+  # op-keychain: op://mixed/keychain/password
+
+Host onlytoken
+  # op: TOKEN=op://onlytoken/token

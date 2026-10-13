@@ -1,0 +1,9 @@
+Host mimolette
+  # op: SAFE=op://mimolette/token
+  SendEnv SAFE
+
+Match user root
+  # op: UNSAFE=op://should-never-inject/value
+
+Host other
+  # op: OTHER=op://other/value

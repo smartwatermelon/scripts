@@ -1,0 +1,18 @@
+Host *
+  # op: FOO=op://shared/foo
+  # op: BAR=op://shared/bar
+
+Host *.internal
+  # op: FOO=op://internal/foo
+
+Host mimolette asiago
+  # op: BAR=op://specific/bar
+  # op: QUOTED="op://quoted/value"
+  # op: UNQUOTED=op://unquoted/value
+  # op: TRAILING=op://trailing/value
+
+Host duplicate
+  # op: DUP=op://first/value
+
+Host duplicate
+  # op: DUP=op://second/value

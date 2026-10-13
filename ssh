@@ -1,0 +1,753 @@
+#!/usr/bin/env bash
+# ssh-wrapper: intercepts ssh to inject secrets from 1Password for annotated hosts.
+#
+# A host in ~/.ssh/config may carry one or more annotation lines of the form:
+#   # op: VARNAME="op://path/to/secret"
+# For any such annotation whose Host block matches the target, the wrapper
+# resolves the secret via `op read`, exports VARNAME=<value>, and execs the
+# real `ssh` with the original argv. Unannotated hosts pass through.
+#
+# Test hooks:
+#   SSH_CONFIG_PATH           override path to ssh_config (default: ~/.ssh/config)
+#   SSH_WRAPPER_REAL_SSH      override the real ssh binary (skip PATH discovery)
+#   SSH_WRAPPER_SKIP_FALLBACKS=1  disable /opt/homebrew and /usr/bin fallbacks
+#   SSH_WRAPPER_CM_DIR        override the ControlMaster socket dir (default: ~/.ssh/cm)
+#   SSH_WRAPPER_CONTROL_PERSIST   override ControlPersist for the unlock master
+#   SSH_WRAPPER_LOCK_WAIT     poll ticks (0.1s each) to wait on a held
+#                             master-creation lock (default 900 = 90s)
+
+set -euo pipefail
+
+# realpath is required for self-recursion detection. On macOS it ships in
+# /bin/realpath since Sonoma; otherwise install with `brew install coreutils`.
+if ! command -v realpath >/dev/null 2>&1; then
+  echo "[ssh-wrapper] realpath not found on PATH; install coreutils ('brew install coreutils') or ensure /bin is on PATH" >&2
+  exit 1
+fi
+
+SELF_PATH="${SELF_PATH:-$(realpath "${BASH_SOURCE[0]}")}"
+SSH_CONFIG="${SSH_CONFIG_PATH:-${HOME}/.ssh/config}"
+
+# Flags that consume the next argv token as their value when written with a
+# space (per ssh(1) §OPTIONS). Bundled forms like -p2222 and -oFoo=bar are
+# single tokens and do not consume the next arg.
+readonly _CONSUMING_FLAGS=" -B -b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w "
+
+# Annotation vars that are left alone when already set (non-empty) in the
+# caller's environment — no op fetch is attempted. OP_SERVICE_ACCOUNT_TOKEN
+# is a bootstrap credential for `op` itself; re-fetching it via `op read`
+# would be circular.
+readonly _SKIP_FETCH_IF_SET=" OP_SERVICE_ACCOUNT_TOKEN "
+
+# ─── argv → hostname ────────────────────────────────────────────────────
+# Extracts the destination from ssh(1) argv. Returns empty string if absent.
+# Flags are passed through unchanged by callers; this function only reads.
+_extract_host() {
+  local arg lower
+  local -i past_dashdash=0
+  while (($#)); do
+    arg="$1"
+    shift
+    if ((past_dashdash)); then
+      # first token after -- is the destination
+      lower="$(printf '%s' "${arg#*@}" | tr '[:upper:]' '[:lower:]')"
+      printf '%s\n' "${lower}"
+      return 0
+    fi
+    if [[ "${arg}" == "--" ]]; then
+      past_dashdash=1
+      continue
+    fi
+    if [[ "${arg}" == -* ]]; then
+      # Is this a consuming flag in its short two-char form (e.g., `-p`)?
+      if [[ ${#arg} -eq 2 && "${_CONSUMING_FLAGS}" == *" ${arg} "* ]]; then
+        # consume next token as its value
+        if (($#)); then shift; fi
+        continue
+      fi
+      # Otherwise: bundled value (-p2222), non-consuming (-v, -4), or unknown
+      # long option. Do not consume next arg.
+      continue
+    fi
+    # First non-flag token is the destination.
+    lower="$(printf '%s' "${arg#*@}" | tr '[:upper:]' '[:lower:]')"
+    printf '%s\n' "${lower}"
+    return 0
+  done
+  return 0
+}
+
+# ─── quote stripping ────────────────────────────────────────────────────
+# Strip one layer of matching " or ' around the input. Unmatched quotes are
+# left untouched so malformed input stays visible to the operator.
+_strip_quotes() {
+  local v="${1-}"
+  if [[ ${#v} -ge 2 ]]; then
+    if [[ "${v:0:1}" == '"' && "${v: -1}" == '"' ]]; then
+      printf '%s' "${v:1:-1}"
+      return 0
+    fi
+    if [[ "${v:0:1}" == "'" && "${v: -1}" == "'" ]]; then
+      printf '%s' "${v:1:-1}"
+      return 0
+    fi
+  fi
+  printf '%s' "${v}"
+}
+
+# ─── host pattern matching ──────────────────────────────────────────────
+# Supports * and ? per spec only. Leading '!' is treated literally; negation
+# is handled by the caller (_ssh_wrapper_commit_block_rank). Compares on lowercase.
+_glob_match() {
+  local pat="$1" target="$2"
+  local pat_lc target_lc
+  pat_lc="$(printf '%s' "${pat}" | tr '[:upper:]' '[:lower:]')"
+  target_lc="$(printf '%s' "${target}" | tr '[:upper:]' '[:lower:]')"
+  # Convert glob (only * and ? metacharacters per spec) to anchored ERE.
+  local re
+  re="^$(printf '%s' "${pat_lc}" | sed 's/\./\\./g; s/\*/.*/g; s/?/./g')\$"
+  [[ "${target_lc}" =~ $re ]]
+}
+
+# Specificity: 0=bare-*, 1=contains glob metachar, 2=literal.
+_rank_pattern() {
+  local pat="$1"
+  if [[ "${pat}" == '*' ]]; then
+    printf '0\n'
+  elif [[ "${pat}" == *'*'* || "${pat}" == *'?'* ]]; then
+    printf '1\n'
+  else
+    printf '2\n'
+  fi
+}
+
+# ─── config parsing / annotation resolution ────────────────────────────
+# These two helpers mutate block_patterns, block_rank, block_seq, and seq
+# from their caller's scope (bash dynamic scoping). Defined at module level
+# so they are not redefined on every _resolve_annotations call.
+_ssh_wrapper_commit_block_rank() {
+  # Recompute block_rank = max rank across any matching pattern.
+  # A negation pattern (!pat) takes priority: if it matches, the host is
+  # excluded from this block regardless of other positive patterns.
+  local p r best=-1
+  for p in "${block_patterns[@]}"; do
+    if [[ "${p:0:1}" == '!' ]]; then
+      if _glob_match "${p:1}" "${target_lc}"; then
+        block_rank=-1
+        return
+      fi
+      continue
+    fi
+    if _glob_match "${p}" "${target_lc}"; then
+      r="$(_rank_pattern "${p}")"
+      if ((r > best)); then best="${r}"; fi
+    fi
+  done
+  block_rank="${best}"
+}
+
+_ssh_wrapper_start_block() {
+  # $1... are the pattern tokens
+  block_patterns=("$@")
+  _ssh_wrapper_commit_block_rank
+  ((block_seq = seq, seq += 1))
+}
+
+# Reads ssh_config, finds Host blocks matching the target, extracts every
+# `# op: VARNAME=value` annotation. Returns one "VARNAME\tvalue" per resolved
+# variable on stdout (after specificity/last-wins tie-break).
+#
+# Match blocks are NOT supported (see spec "Out of Scope"); they terminate
+# the current Host block so annotations inside a Match are not silently
+# attributed to the preceding Host. A user who puts `# op:` inside a Match
+# block gets no injection for it.
+#
+# Args: <target-host> <config-file>
+_resolve_annotations() {
+  local target="$1" config="$2"
+  [[ -f "${config}" ]] || return 0
+  [[ -n "${target}" ]] || return 0
+
+  local target_lc
+  target_lc="$(printf '%s' "${target}" | tr '[:upper:]' '[:lower:]')"
+
+  # Walk config. Track current block's patterns and best rank for this target.
+  local line stripped
+  local -a block_patterns=()
+  local -i block_rank=-1 block_seq=0 seq=0
+  # Collected tuples: parallel arrays varnames[i], values[i], ranks[i], seqs[i]
+  local -a tuple_varnames=() tuple_values=() tuple_ranks=() tuple_seqs=()
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    # Strip CR (files saved with CRLF)
+    line="${line%$'\r'}"
+    # Leading whitespace-trim for keyword detection
+    stripped="${line#"${line%%[![:space:]]*}"}"
+    if [[ "${stripped}" =~ ^[Hh][Oo][Ss][Tt][[:space:]]+ ]]; then
+      # Everything after the keyword is the pattern list.
+      local rest="${stripped#*[[:space:]]}"
+      local -a patterns
+      read -r -a patterns <<<"${rest}"
+      _ssh_wrapper_start_block "${patterns[@]}"
+      continue
+    fi
+    if [[ "${stripped}" =~ ^[Mm][Aa][Tt][Cc][Hh][[:space:]] ]]; then
+      # Match blocks aren't evaluated — conservatively stop attributing
+      # annotations to any prior Host until a new Host keyword appears.
+      block_patterns=()
+      block_rank=-1
+      continue
+    fi
+    # Only collect annotations if the current block matches.
+    ((block_rank >= 0)) || continue
+    if [[ "${stripped}" =~ ^#[[:space:]]*op:[[:space:]]*([A-Z_][A-Z0-9_]*)=(.+)$ ]]; then
+      local varname="${BASH_REMATCH[1]}"
+      local raw_value="${BASH_REMATCH[2]}"
+      # Right-trim whitespace
+      raw_value="${raw_value%"${raw_value##*[![:space:]]}"}"
+      # Strip optional surrounding quotes
+      local value
+      value="$(_strip_quotes "${raw_value}")"
+      tuple_varnames+=("${varname}")
+      tuple_values+=("${value}")
+      tuple_ranks+=("${block_rank}")
+      tuple_seqs+=("${block_seq}")
+    fi
+  done <"${config}"
+
+  # Merge: for each varname, pick highest rank; tie → highest seq (last-wins).
+  # Use an associative array to index by varname; bash 3.2 lacks it, but macOS
+  # ships bash 3.2 by default. We're under #!/usr/bin/env bash which may point
+  # to homebrew bash 5. Fall back to O(n²) lookup to stay portable.
+  local -a out_vars=() out_values=()
+  local -i i j
+  for ((i = 0; i < ${#tuple_varnames[@]}; i++)); do
+    local v="${tuple_varnames[i]}"
+    local keep=1
+    for ((j = 0; j < ${#tuple_varnames[@]}; j++)); do
+      ((i == j)) && continue
+      [[ "${tuple_varnames[j]}" == "${v}" ]] || continue
+      if ((tuple_ranks[j] > tuple_ranks[i])); then
+        keep=0
+        break
+      fi
+      if ((tuple_ranks[j] == tuple_ranks[i] && tuple_seqs[j] > tuple_seqs[i])); then
+        keep=0
+        break
+      fi
+    done
+    ((keep)) || continue
+    # Also de-dup: if we've already emitted this varname, skip.
+    local dup=0
+    for ((j = 0; j < ${#out_vars[@]}; j++)); do
+      if [[ "${out_vars[j]}" == "${v}" ]]; then
+        dup=1
+        break
+      fi
+    done
+    ((dup)) && continue
+    out_vars+=("${v}")
+    out_values+=("${tuple_values[i]}")
+  done
+
+  for ((i = 0; i < ${#out_vars[@]}; i++)); do
+    printf '%s\t%s\n' "${out_vars[i]}" "${out_values[i]}"
+  done
+}
+
+# ─── keychain annotation resolution ────────────────────────────────────
+# Like _resolve_annotations but for `# op-keychain: op://...` lines. The
+# payload is a bare op:// reference (no VARNAME=); the target keychain
+# is implicit (default login keychain on the remote).
+#
+# Returns a single op:// ref on stdout, or empty if no matching
+# annotation. Uses the same specificity rank / last-wins merge as
+# _resolve_annotations. Shares its block-walker helpers.
+_resolve_keychain_annotation() {
+  local target="$1" config="$2"
+  [[ -f "${config}" ]] || return 0
+  [[ -n "${target}" ]] || return 0
+
+  local target_lc
+  target_lc="$(printf '%s' "${target}" | tr '[:upper:]' '[:lower:]')"
+
+  local line stripped
+  local -a block_patterns=()
+  local -i block_rank=-1 block_seq=0 seq=0
+  local -a tuple_refs=() tuple_ranks=() tuple_seqs=()
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    stripped="${line#"${line%%[![:space:]]*}"}"
+    if [[ "${stripped}" =~ ^[Hh][Oo][Ss][Tt][[:space:]]+ ]]; then
+      local rest="${stripped#*[[:space:]]}"
+      local -a patterns
+      read -r -a patterns <<<"${rest}"
+      _ssh_wrapper_start_block "${patterns[@]}"
+      continue
+    fi
+    if [[ "${stripped}" =~ ^[Mm][Aa][Tt][Cc][Hh][[:space:]] ]]; then
+      block_patterns=()
+      block_rank=-1
+      continue
+    fi
+    ((block_rank >= 0)) || continue
+    if [[ "${stripped}" =~ ^#[[:space:]]*op-keychain:[[:space:]]*(.+)$ ]]; then
+      local raw_value="${BASH_REMATCH[1]}"
+      raw_value="${raw_value%"${raw_value##*[![:space:]]}"}"
+      local value
+      value="$(_strip_quotes "${raw_value}")"
+      # Post-validate: accept only op:// refs. Silently skip other values
+      # rather than surfacing them as secret refs.
+      [[ "${value}" == op://* ]] || continue
+      tuple_refs+=("${value}")
+      tuple_ranks+=("${block_rank}")
+      tuple_seqs+=("${block_seq}")
+    fi
+  done <"${config}"
+
+  local -i best_rank=-1 best_seq=-1 best_idx=-1 i
+  for ((i = 0; i < ${#tuple_refs[@]}; i += 1)); do
+    if ((tuple_ranks[i] > best_rank)) \
+      || ((tuple_ranks[i] == best_rank && tuple_seqs[i] > best_seq)); then
+      best_rank=${tuple_ranks[i]}
+      best_seq=${tuple_seqs[i]}
+      best_idx=${i}
+    fi
+  done
+  ((best_idx >= 0)) || return 0
+  printf '%s\n' "${tuple_refs[best_idx]}"
+}
+
+# ─── argv inspection: detect -O (ControlMaster control op) ─────────────
+# Scans argv for a standalone `-O` token (ssh's ControlMaster control
+# command: -O check|stop|exit|forward|cancel). Returns 0 if found
+# before a `--` terminator, else 1. `-o` (lowercase) is not matched;
+# only the bare two-character `-O`.
+_argv_has_dash_oh() {
+  local arg
+  while (($#)); do
+    arg="$1"
+    shift
+    [[ "${arg}" == "--" ]] && return 1
+    [[ "${arg}" == "-O" ]] && return 0
+  done
+  return 1
+}
+
+# ─── ControlMaster socket path / creation lock ─────────────────────────
+# The unlock master is keyed on the TARGET HOST, not the wrapper's PID, so
+# that consecutive `ssh mimolette.local` invocations reuse one master --
+# and therefore trigger only ONE `op read` (one TouchID modal) per
+# ControlPersist window instead of one per connect. A PID-keyed socket
+# (the original `ssh-unlock-$$.sock`) can never be reused, which is what
+# made agentic/scripted use fire a modal barrage.
+#
+# Unix domain socket paths are capped at ~104 bytes on macOS (sockaddr_un
+# sun_path); ssh rejects longer ones outright with "ControlPath too long".
+# ~/.ssh/cm/unlock-<host>.sock leaves ample headroom for real hostnames.
+_cm_dir() {
+  printf '%s\n' "${SSH_WRAPPER_CM_DIR:-${HOME}/.ssh/cm}"
+}
+
+# Maps a target host to its socket path. Any character outside
+# [A-Za-z0-9._-] becomes '_' so a hostile/odd destination string cannot
+# escape the socket directory via '/' or '..'.
+_cm_socket_path() {
+  local host="$1" safe dir
+  safe="$(printf '%s' "${host}" | tr -c 'A-Za-z0-9._-' '_')"
+  dir="$(_cm_dir)"
+  printf '%s/unlock-%s.sock\n' "${dir}" "${safe}"
+}
+
+# True when a live master owns this socket. `ssh -O check` is the only
+# reliable probe: the socket FILE existing proves nothing (a stale socket
+# outlives its master), and `-fNM` cannot be used as a test because it
+# exits 0 even when it refuses to multiplex (see _cm_acquire_lock).
+_cm_master_alive() {
+  local sock="$1" host="$2" real_ssh="$3"
+  "${real_ssh}" -O check -o ControlPath="${sock}" "${host}" >/dev/null 2>&1
+}
+
+# Atomic create-lock around master setup.
+#
+# Required, not defensive: `ssh -fNM` against an ALREADY-LIVE socket exits
+# 0 while printing "ControlSocket ... already exists, disabling
+# multiplexing" and leaving a stray backgrounded ssh behind. Exit status
+# therefore cannot distinguish "I created the master" from "someone beat
+# me to it", so concurrent wrappers must be serialized before they call
+# it. Verified empirically 2026-09-10.
+#
+# `mkdir` is the lock primitive because it is atomic on every filesystem
+# and macOS ships no flock(1).
+_cm_acquire_lock() {
+  local sock="$1"
+  if mkdir "${sock}.lock" 2>/dev/null; then
+    return 0
+  fi
+  # Held. If the holder died without releasing (SIGKILL, or a signal in a
+  # window with no trap installed), the lock would wedge every later
+  # invocation into the wait-then-give-up path forever. Break a lock older
+  # than the master-open budget: ConnectTimeout=10 plus the unlock pipe
+  # bounds an honest holder well under 60s.
+  _cm_lock_is_stale "${sock}" || return 1
+  rmdir "${sock}.lock" 2>/dev/null || true
+  mkdir "${sock}.lock" 2>/dev/null
+}
+
+# True when the lock dir exists and its mtime is more than 60s old.
+# `find -mmin +1` avoids depending on stat(1) flag portability.
+_cm_lock_is_stale() {
+  local sock="$1" hit
+  [[ -d "${sock}.lock" ]] || return 1
+  hit="$(find "${sock}.lock" -maxdepth 0 -mmin +1 2>/dev/null)"
+  [[ -n "${hit}" ]]
+}
+
+_cm_release_lock() {
+  local sock="${1-}"
+  [[ -n "${sock}" ]] || return 0
+  rmdir "${sock}.lock" 2>/dev/null || true
+}
+
+# ─── keychain unlock dance ─────────────────────────────────────────────
+# Cleanup handler: referenced by trap. Reads module-scope _KC_* globals
+# so the trap string is a single unquoted token (no SC2064 concerns).
+_keychain_cleanup() {
+  # Release the creation lock even if we never got as far as opening a
+  # master, so a crash between lock and master does not wedge every
+  # later invocation into the slow path forever.
+  _cm_release_lock "${_KC_SOCK:-}"
+  [[ -n "${_KC_SOCK:-}" && -n "${_KC_HOST:-}" && -n "${_KC_REAL_SSH:-}" ]] || return 0
+  "${_KC_REAL_SSH}" -O exit -o ControlPath="${_KC_SOCK}" "${_KC_HOST}" >/dev/null 2>&1 || true
+  rm -f "${_KC_SOCK}"
+  _KC_SOCK=""
+  _KC_HOST=""
+  _KC_REAL_SSH=""
+}
+
+# Fetches the login-keychain password from 1Password, opens a
+# short-lived multiplexed ssh master, and pipes an unlock-keychain
+# command into the remote's `security -i` REPL. The REPL dispatches
+# unlock-keychain in-process, so the password never appears in argv
+# on either side (see docs/plans/2026-04-24-ssh-keychain-unlock.md
+# for the argv-leak threat model).
+#
+# On success: prints the ControlPath socket to stdout and returns 0.
+# Caller should `exec "$REAL_SSH" -o ControlPath=<sock> "$@"`. The
+# master is opened with ControlPersist (default 4h, override via
+# SSH_WRAPPER_CONTROL_PERSIST) so it auto-exits that long after the last
+# client disconnects; no trap-based cleanup survives exec. The master is
+# deliberately long-lived and shared: later invocations reuse it and so
+# skip the op read that raises the 1Password modal.
+#
+# On any failure: warns to stderr, cleans up master/socket, returns 1.
+# Caller should fall through to a plain `exec "$REAL_SSH" "$@"`.
+_unlock_remote_keychain() {
+  local host="$1" ref="$2" real_ssh="$3"
+  local sock pw
+
+  sock="$(_cm_socket_path "${host}")"
+
+  # ── Fast path: an unlock master for this host is already running ──
+  # Reuse it and return WITHOUT calling op read. This is the whole point
+  # of the host-keyed socket: no `op read` means no 1Password modal, so
+  # repeated/scripted connects cost one prompt per ControlPersist window
+  # rather than one per invocation.
+  #
+  # Skipping the re-unlock is safe because every session riding this
+  # master shares the sshd session the unlock already ran in, so the
+  # remote keychain is still unlocked for it.
+  if _cm_master_alive "${sock}" "${host}" "${real_ssh}"; then
+    printf '%s\n' "${sock}"
+    return 0
+  fi
+
+  local cm_dir
+  cm_dir="$(_cm_dir)"
+  if ! mkdir -p "${cm_dir}" 2>/dev/null; then
+    printf '[ssh-wrapper] keychain-unlock: cannot create socket dir %s; skipping unlock\n' "${cm_dir}" >&2
+    return 1
+  fi
+  chmod 700 "${cm_dir}" 2>/dev/null || true
+
+  # ── Serialize master creation ──
+  # Without the lock, parallel wrappers (agent tooling runs Bash calls
+  # concurrently) each run the full dance and each raise a modal.
+  if ! _cm_acquire_lock "${sock}"; then
+    # Another wrapper is mid-setup. Wait for its master rather than
+    # opening a competing one or raising a second modal.
+    #
+    # The budget must cover a COLD start by the holder, which includes a
+    # human-paced TouchID prompt on `op read` -- 15s was not enough and
+    # made every parallel peer give up and skip the unlock. Poll budget is
+    # in 0.1s ticks (default 900 = 90s). Test hook: SSH_WRAPPER_LOCK_WAIT.
+    local -i wait_ticks="${SSH_WRAPPER_LOCK_WAIT:-900}"
+    local -i waited=0
+    while ((waited < wait_ticks)); do
+      if _cm_master_alive "${sock}" "${host}" "${real_ssh}"; then
+        printf '%s\n' "${sock}"
+        return 0
+      fi
+      # The holder may have finished WITHOUT leaving a usable master (its
+      # op read failed, or it was interrupted). Once the lock is gone
+      # there is nothing left to wait for, so stop early and let this
+      # invocation fall through instead of burning the whole budget.
+      if [[ ! -d "${sock}.lock" ]]; then
+        break
+      fi
+      sleep 0.1
+      ((waited += 1))
+    done
+    if _cm_master_alive "${sock}" "${host}" "${real_ssh}"; then
+      printf '%s\n' "${sock}"
+      return 0
+    fi
+    printf '[ssh-wrapper] keychain-unlock: no master from concurrent setup on %s; skipping unlock\n' "${host}" >&2
+    return 1
+  fi
+
+  # Lock is held by us from here on. Install the cleanup trap IMMEDIATELY,
+  # before anything that can fail or block, so a signal (closing the
+  # terminal during the TouchID prompt or the master open) still releases
+  # it. _keychain_cleanup tears down a master only when _KC_HOST and
+  # _KC_REAL_SSH are also set, so arming it with just _KC_SOCK here makes
+  # it a lock-release-only handler until the master actually exists.
+  _KC_SOCK="${sock}"
+  trap _keychain_cleanup EXIT INT TERM HUP
+
+  # Re-check: the holder we raced may have finished between our first
+  # probe and the lock acquisition.
+  if _cm_master_alive "${sock}" "${host}" "${real_ssh}"; then
+    _cm_release_lock "${sock}"
+    _KC_SOCK=""
+    trap - EXIT INT TERM HUP
+    printf '%s\n' "${sock}"
+    return 0
+  fi
+
+  # A socket file with no live master behind it is stale (previous master
+  # exited, or the machine rebooted). ssh will not overwrite it, so clear
+  # it before opening -- otherwise -fNM silently declines to multiplex.
+  rm -f "${sock}"
+
+  # _fetch_op installs and then CLEARS its own EXIT/INT/TERM trap for a
+  # tempfile, which wipes the lock-release trap armed above. Re-arm it
+  # immediately afterwards so the window between the op read and the
+  # master open is not left unprotected.
+  #
+  # Auth-context fix: the `# op:` loop may have already exported
+  # OP_SERVICE_ACCOUNT_TOKEN (so `sshd` can SendEnv it to the remote).
+  # Once that variable is set, the local `op` CLI uses service-account
+  # auth, which is typically scoped to a single Automation vault and
+  # cannot read from the user's Personal vault where keychain
+  # passwords live. Temporarily unset it across the op read, then
+  # restore so the SendEnv forward still fires on the final exec.
+  local saved_token saved_token_was_set=0 pw_rc=0
+  if [[ -n "${OP_SERVICE_ACCOUNT_TOKEN+set}" ]]; then
+    saved_token_was_set=1
+    saved_token="${OP_SERVICE_ACCOUNT_TOKEN}"
+    unset OP_SERVICE_ACCOUNT_TOKEN
+  fi
+  pw="$(_fetch_op "${ref}" "op-keychain")" || pw_rc=$?
+  # Re-arm: _fetch_op cleared the trap we installed at lock acquisition.
+  trap _keychain_cleanup EXIT INT TERM HUP
+  if ((saved_token_was_set)); then
+    export OP_SERVICE_ACCOUNT_TOKEN="${saved_token}"
+  fi
+  if ((pw_rc != 0)); then
+    printf '[ssh-wrapper] keychain-unlock: op read failed; skipping unlock\n' >&2
+    _cm_release_lock "${sock}"
+    _KC_SOCK=""
+    trap - EXIT INT TERM HUP
+    return 1
+  fi
+
+  # Now that a master is about to exist, arm full teardown (not just the
+  # lock release) for the pre-exec window.
+  _KC_HOST="${host}"
+  _KC_REAL_SSH="${real_ssh}"
+
+  # BatchMode=yes: refuse every interactive auth prompt during master
+  # setup. Key reason: during the FileVault preboot SSH phase (Apple
+  # Silicon, macOS Tahoe+), the system runs a minimal sshd from the
+  # sealed boot partition that accepts only password auth and drops
+  # the connection after the data volume unlocks. Without BatchMode,
+  # the auxiliary -fNM master prompts the user on /dev/tty for the
+  # FileVault password — and even if entered, the resulting master
+  # dies seconds later when sshd disconnects. With BatchMode, the
+  # master fails fast (no UI), the wrapper falls through to the
+  # user's plain `exec ssh` (which DOES allow the password prompt),
+  # and the user's session performs the FileVault unlock as intended.
+  # ConnectTimeout=10 prevents hangs on partially-up hosts.
+  #
+  # ControlPersist is the prompt budget: the master idles this long after
+  # the last client disconnects, and only its expiry costs another
+  # `op read` (one TouchID modal). 60s -- the original value -- expired
+  # between back-to-back connects, so it effectively never got reused.
+  # 4h covers a working session; override with SSH_WRAPPER_CONTROL_PERSIST.
+  local persist="${SSH_WRAPPER_CONTROL_PERSIST:-4h}"
+  if ! "${real_ssh}" -fNM \
+    -o ControlPath="${sock}" -o ControlPersist="${persist}" \
+    -o BatchMode=yes -o ConnectTimeout=10 \
+    "${host}" >/dev/null 2>&1; then
+    printf '[ssh-wrapper] keychain-unlock: ControlMaster open failed for %s (no non-interactive auth available); skipping unlock\n' "${host}" >&2
+    _keychain_cleanup
+    trap - EXIT INT TERM HUP
+    return 1
+  fi
+
+  # Bash's printf is a shell builtin, so the expansion of %s does not
+  # spawn a subprocess with the password in argv. `security -i` on the
+  # remote reads commands from stdin and dispatches in-process.
+  #
+  # No keychain name: `unlock-keychain` with no positional arg targets
+  # the remote's default keychain. Passing `login` as a shorthand does
+  # not resolve on all macOS versions (the CLI expects a path or a
+  # filename, not the human-readable alias). Using the default is
+  # portable and matches what a GUI login would unlock.
+  #
+  # stderr from the remote `security -i` is captured and surfaced in
+  # the warning so future failures (wrong password, locked-out account,
+  # keychain integrity errors, etc.) don't require manual investigation.
+  local sec_err sec_rc
+  if sec_err="$(printf 'unlock-keychain -p %s\n' "${pw}" \
+    | "${real_ssh}" -o ControlPath="${sock}" "${host}" 'exec security -i' 2>&1 >/dev/null)"; then
+    sec_rc=0
+  else
+    sec_rc=$?
+  fi
+  if ((sec_rc != 0)); then
+    local err_one_line="${sec_err//$'\n'/ | }"
+    printf '[ssh-wrapper] keychain-unlock: remote security -i exit=%d; continuing with session. stderr: %s\n' \
+      "${sec_rc}" "${err_one_line}" >&2
+    # Do not tear down; the master is still usable for the user's session.
+  fi
+
+  # Clear trap — the master persists via ControlPersist after exec, and
+  # from here on it is a shared resource that later invocations reuse, so
+  # cleanup must NOT tear it down.
+  trap - EXIT INT TERM HUP
+  # Release the creation lock only now that the master is actually up, so
+  # a concurrent waiter's next probe finds a live master rather than an
+  # unlocked-but-empty socket path.
+  _cm_release_lock "${sock}"
+  printf '%s\n' "${sock}"
+  return 0
+}
+
+# ─── real ssh binary discovery ─────────────────────────────────────────
+_find_real_ssh() {
+  local self="${SELF_PATH}"
+  local dir candidate canon
+  local -a path_dirs
+  IFS=':' read -ra path_dirs <<<"${PATH}"
+  for dir in "${path_dirs[@]}"; do
+    candidate="${dir}/ssh"
+    [[ -x "${candidate}" ]] || continue
+    canon="$(realpath "${candidate}")"
+    if [[ "${canon}" != "${self}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  if [[ "${SSH_WRAPPER_SKIP_FALLBACKS:-0}" != "1" ]]; then
+    for candidate in /opt/homebrew/bin/ssh /usr/bin/ssh; do
+      if [[ -x "${candidate}" ]]; then
+        canon="$(realpath "${candidate}")"
+        if [[ "${canon}" != "${self}" ]]; then
+          printf '%s\n' "${candidate}"
+          return 0
+        fi
+      fi
+    done
+  fi
+  printf '[ssh-wrapper] Could not find real ssh binary in PATH or fallbacks\n' >&2
+  return 1
+}
+
+# ─── op read wrapper ───────────────────────────────────────────────────
+# Stdout: resolved value (trailing newline stripped).
+# Stderr: diagnostic on failure.
+# Exit:   0 on success; non-zero with categorized message on failure.
+_fetch_op() {
+  local ref="$1" varname="$2"
+  if ! command -v op >/dev/null 2>&1; then
+    printf '[ssh-wrapper] op CLI not installed; cannot resolve %s (install: brew install --cask 1password-cli)\n' "${varname}" >&2
+    return 1
+  fi
+  local stdout stderr rc
+  # Capture stdout and stderr separately.
+  local tmp_err
+  tmp_err="$(mktemp)"
+  trap 'rm -f "${tmp_err}"' EXIT INT TERM
+  if stdout="$(op read "${ref}" 2>"${tmp_err}")"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  stderr="$(cat "${tmp_err}")"
+  rm -f "${tmp_err}"
+  trap - EXIT INT TERM
+  if ((rc == 0)); then
+    # Strip the trailing newline that op read appends.
+    printf '%s' "${stdout%$'\n'}"
+    return 0
+  fi
+  # Categorize failure
+  if [[ "${stderr}" == *"not currently signed in"* || "${stderr}" == *"signin"* ]]; then
+    printf "[ssh-wrapper] op session expired; run 'eval \$(op signin)' and retry (%s)\n" "${varname}" >&2
+    return 1
+  fi
+  printf '[ssh-wrapper] op read failed for %s (%s): %s\n' "${varname}" "${ref}" "${stderr}" >&2
+  return 1
+}
+
+# ─── linear body (skipped when sourced for tests) ──────────────────────
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  TARGET_HOST="$(_extract_host "$@")"
+  if [[ -n "${TARGET_HOST}" && -f "${SSH_CONFIG}" ]]; then
+    # Resolved before the loop rather than inline in the process
+    # substitution: SC2312 flags the nested form, and an intermediate
+    # variable keeps the failure explicit. Semantics are unchanged -- on
+    # failure _ANNOTATIONS stays empty, the loop body never runs, and the
+    # wrapper falls through with no secret injection.
+    _ANNOTATIONS=""
+    if ! _ANNOTATIONS="$(_resolve_annotations "${TARGET_HOST}" "${SSH_CONFIG}")"; then
+      printf '[ssh-wrapper] _resolve_annotations failed for %s; falling through with no secret injection\n' "${TARGET_HOST}" >&2
+    fi
+    while IFS=$'\t' read -r op_var op_ref; do
+      [[ -n "${op_var}" ]] || continue
+      if [[ "${_SKIP_FETCH_IF_SET}" == *" ${op_var} "* && -n "${!op_var:-}" ]]; then
+        continue
+      fi
+      op_value="$(_fetch_op "${op_ref}" "${op_var}")" || exit $?
+      export "${op_var}=${op_value}"
+      # The trailing newline below is REQUIRED. _resolve_annotations
+      # terminates every line with \n, but the command substitution above
+      # strips trailing newlines, so the last annotation arrives unterminated;
+      # `printf '%s\n'` re-adds one. Without it `read` returns non-zero on
+      # that final line and the loop exits early, silently dropping the LAST
+      # annotation. When _ANNOTATIONS is empty this feeds one blank line,
+      # which the `-n` guard above skips.
+    done < <(printf '%s\n' "${_ANNOTATIONS}")
+  fi
+  REAL_SSH="${SSH_WRAPPER_REAL_SSH:-$(_find_real_ssh)}"
+
+  # Remote login-keychain unlock via `# op-keychain: op://...` annotation.
+  # Opt-in, per-host. Fall-through on any failure: a missed keychain
+  # unlock is a convenience loss, not a security hole.
+  KEYCHAIN_SOCK=""
+  if [[ -n "${TARGET_HOST}" && -f "${SSH_CONFIG}" ]] \
+    && ! _argv_has_dash_oh "$@"; then
+    keychain_ref="$(_resolve_keychain_annotation "${TARGET_HOST}" "${SSH_CONFIG}" || true)"
+    if [[ -n "${keychain_ref}" ]]; then
+      KEYCHAIN_SOCK="$(_unlock_remote_keychain "${TARGET_HOST}" "${keychain_ref}" "${REAL_SSH}" || true)"
+    fi
+  fi
+
+  if [[ -n "${KEYCHAIN_SOCK}" ]]; then
+    exec "${REAL_SSH}" -o "ControlPath=${KEYCHAIN_SOCK}" "$@"
+  fi
+  exec "${REAL_SSH}" "$@"
+fi

@@ -1,0 +1,128 @@
+name: Bats Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+  push:
+    branches: [main]
+
+# Read-only: this workflow runs tests and reports a status. It never
+# comments, labels, or pushes.
+permissions:
+  contents: read
+
+concurrency:
+  group: bats-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bats:
+    # ubuntu-latest, not macos-latest. GitHub bills macOS runners at 10x,
+    # so a ~40s job costs ~10 minutes of the monthly allowance; Linux is 1x.
+    #
+    # The real platform is still covered: the pre-push hook runs the full
+    # suite on the developer's Mac before anything reaches CI, for free.
+    # CI's job here is to catch portability regressions cheaply, which is
+    # exactly what a Linux run is good at -- it found bash 3.2 and a missing
+    # `timeout` on the first two attempts.
+    #
+    # Scripts that genuinely need macOS guard for it rather than assuming
+    # it; see the skip guards in the suites.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # Pinned to a SHA per zizmor's unpinned-uses policy; the trailing
+      # comment is what Dependabot reads to offer version bumps.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This job only reads code; it never pushes. Not persisting the
+          # token keeps it out of the checkout's git config.
+          persist-credentials: false
+
+      - name: Install bats, bash 5, and coreutils
+        # Ubuntu ships bash 5 and GNU coreutils already, so this only
+        # needs bats. shellcheck comes from apt too.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bats
+          # Install shellcheck from the upstream release, not apt. The package
+          # lags, and an older version reports findings that a current one
+          # does not (it flagged an SC2015 that 0.11.0 accepts). Pinning
+          # keeps CI reproducible and matched to what the pre-commit hook
+          # runs locally.
+          SC_VERSION=v0.11.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SC_VERSION}/shellcheck-${SC_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJf - --strip-components=1 -C /usr/local/bin "shellcheck-${SC_VERSION}/shellcheck"
+          shellcheck --version
+
+      - name: Show versions
+        # Assert bash 5 explicitly. The suites use bash 4+ syntax such as
+        # negative array indices; a runner image that regressed to an older
+        # bash should fail here with a clear message rather than deep in a
+        # test with a "bad array subscript" error.
+        run: |
+          bats --version
+          bash --version | head -1
+          git --version
+          bash_major="$(bash -c 'echo "${BASH_VERSINFO[0]}"')"
+          if [ "${bash_major}" -lt 5 ]; then
+            echo "::error::expected bash 5+, got ${bash_major} ($(command -v bash))"
+            exit 1
+          fi
+
+      - name: Run bats suites
+        # The suites are hermetic: smb-mount and ssh-wrapper stub op,
+        # security, osascript, and ssh onto PATH, and nothing calls a real
+        # network service. One walk test pulls from a nonexistent remote to
+        # prove the walk survives a failed pull; GIT_SSH_COMMAND=/usr/bin/false
+        # makes that fail instantly instead of waiting on DNS or a TCP
+        # connect on a network-restricted runner.
+        env:
+          GIT_SSH_COMMAND: /usr/bin/false
+        run: |
+          # Glob, not an explicit list: a new tests/*.bats file is picked up
+          # automatically. An explicit list would let a new suite be added
+          # and silently never run in CI.
+          bats --print-output-on-failure tests/*.bats
+
+      - name: Shellcheck all scripts
+        # CLAUDE.md requires `shellcheck -S info` clean with no `disable`
+        # directives. That held only by convention until now; this makes a
+        # regression fail the build.
+        run: |
+          status=0
+          for script in *.sh lib/*.sh ssh sleepnow; do
+            [ -e "${script}" ] || continue
+            # -x is what actually enables following a `source`;
+            # --source-path only says where to look. Without -x shellcheck
+            # never reads lib/repo-walker.sh and reports a false SC2034 for
+            # REPO_WALKER_DESC and REPO_WALKER_DIRVAR, which the library
+            # does read.
+            #
+            # --source-path=SCRIPTDIR lets shellcheck follow the wrappers'
+            # `source lib/repo-walker.sh`, without which it also emits a
+            # false SC2034 for REPO_WALKER_DESC (read by the library it
+            # cannot see).
+            #
+            # SC1091 is excluded because it means only "I could not open the
+            # sourced file". reset-tccd.sh sources
+            # ~/.config/bash/functions.sh, a developer-machine file that
+            # will never exist on a runner. Excluding it does not weaken the
+            # check: it is about shellcheck's file access, not about the
+            # code, and the pre-commit hook still runs unrestricted locally
+            # where those files do exist.
+            if ! shellcheck -S info -x --exclude=SC1091 --source-path=SCRIPTDIR "${script}"; then
+              echo "::error file=${script}::shellcheck -S info reported findings"
+              status=1
+            fi
+          done
+          # Same coverage as the loop above, plus tests/: a directive in
+          # any file we ship is a policy violation, and the bats suites are
+          # not shellchecked in CI so the grep is the only thing watching
+          # them.
+          if grep -rn 'shellcheck disable' -- *.sh lib/ tests/ ssh sleepnow 2>/dev/null; then
+            echo "::error::'# shellcheck disable' directives are not permitted (see CLAUDE.md)"
+            status=1
+          fi
+          exit "${status}"
