@@ -247,7 +247,9 @@ teardown() {
   git -C "${r}" commit -qm one
   git -C "${r}" remote add origin git@github.com:smartwatermelon/repo3-does-not-exist-xyz.git
   run bash -c "MY_REPOS_DIR='${TMPDIR_T}/walkdir' '${REPO_ROOT}/my-repos.sh'"
-  [ "${status}" -eq 0 ]
+  # The origin does not exist, so the pull fails and the walk exits 1; what
+  # matters here is that it reaches the summary instead of aborting early.
+  [ "${status}" -eq 1 ]
   [[ "${output}" == *"repo3"* ]]
   [[ "${output}" == *"Total:"* ]]
 }
@@ -325,13 +327,44 @@ _move_upstream_tag() {
   _move_upstream_tag
 
   run bash -c "MY_REPOS_DIR='${TMPDIR_T}/walkdir' '${REPO_ROOT}/my-repos.sh'"
-  [ "${status}" -eq 0 ]
+  [ "${status}" -eq 1 ]
   [[ "${output}" == *"pull failed"* ]]
   # The failure must come from the divergence, not from the tag.
   [[ "${output}" != *"would clobber existing tag"* ]]
   [[ "${output}" == *"Failed: 1"* ]]
   after="$(git -C "${walked}" rev-parse HEAD)"
   [ "${after}" = "${before}" ]
+}
+
+@test "walk exits 1 when a pull fails, in both wrappers" {
+  # An origin whose path does not exist: the pull fails.
+  mkdir -p "${TMPDIR_T}/walkdir" "${TMPDIR_T}/beacondir"
+  for d in walkdir/brokenrepo beacondir/brokenrepo; do
+    _GIT_WRAPPER_ACTIVE=1 git -C "${TMPDIR_T}" init -q -b main "${d}"
+  done
+  git -C "${TMPDIR_T}/walkdir/brokenrepo" remote add origin \
+    "${TMPDIR_T}/missing/smartwatermelon/brokenrepo.git"
+  git -C "${TMPDIR_T}/beacondir/brokenrepo" remote add origin \
+    "${TMPDIR_T}/missing/beacon-biosignals/brokenrepo.git"
+
+  run bash -c "MY_REPOS_DIR='${TMPDIR_T}/walkdir' '${REPO_ROOT}/my-repos.sh' --quiet"
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Failed: 1"* ]]
+  [[ "${output}" == *"- brokenrepo"* ]]
+
+  run bash -c "BEACON_REPOS_DIR='${TMPDIR_T}/beacondir' '${REPO_ROOT}/beacon-repos.sh' --quiet"
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Failed: 1"* ]]
+}
+
+@test "walk exits 0 when the only repo left alone is dirty" {
+  _mk_tag_upstream
+  echo scratch >"${walked}/untracked"
+
+  run bash -c "MY_REPOS_DIR='${TMPDIR_T}/walkdir' '${REPO_ROOT}/my-repos.sh'"
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"Skipped: 1"* ]]
+  [[ "${output}" == *"Failed: 0"* ]]
 }
 
 @test "parse_args accepts --show-dead-branches and --status" {
@@ -1013,7 +1046,11 @@ _mkrepo() {
   _mkrepo "${TMPDIR_T}/walk/moved" git@github.com:smartwatermelon/moved.git
   run bash -c "BASH_ENV='${stub}' MY_REPOS_DIR='${TMPDIR_T}/walk' \
     bash '${REPO_ROOT}/my-repos.sh' --check-remotes 2>&1"
-  [ "${status}" -eq 0 ]
+  # The fake origin cannot be pulled, so the walk exits 1 for that reason.
+  # This test cannot prove a mis-pointed remote alone leaves the status at 0:
+  # git remote get-url applies insteadOf, so a reachable fake is not cheap.
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Failed: 1"* ]]
   [[ "${output}" == *"Mis-pointed: 1"* ]]
   [[ "${output}" == *"Mis-pointed remotes:"* ]]
   [[ "${output}" == *"Re-run with --fix-remotes"* ]]
