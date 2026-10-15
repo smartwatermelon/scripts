@@ -893,10 +893,11 @@ repo_walker_main() {
         switched=true
       fi
 
-      # Clean tree — attempt pull
+      # Clean tree — attempt pull. --force lets a moved upstream tag
+      # overwrite ours; --ff-only still guards the branch.
       local pull_ok pull_output
       pull_ok=true
-      if pull_output="$(git -C "${repo}" pull --ff-only 2>&1)"; then
+      if pull_output="$(git -C "${repo}" pull --ff-only --force 2>&1)"; then
         if ! "${REPO_WALKER_QUIET}"; then
           if grep -q "Already up to date" <<<"${pull_output}"; then
             echo -e "  ${REPO_WALKER_GREEN}✓ up to date${REPO_WALKER_RESET}"
