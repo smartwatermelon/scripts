@@ -252,6 +252,88 @@ teardown() {
   [[ "${output}" == *"Total:"* ]]
 }
 
+# Builds a local "upstream" for the moved-tag tests: a bare repo whose path
+# contains "smartwatermelon" (so the walker's org filter accepts the remote),
+# a scratch clone used to push to it, and a walked clone under walkdir/.
+#
+# The walked clone sets fetch.pruneTags itself rather than relying on the
+# developer's global config. pruneTags adds a non-forced
+# refs/tags/*:refs/tags/* refspec to every fetch, which is what turns a
+# moved upstream tag into "would clobber existing tag". Without it, plain
+# tag auto-follow never updates an existing tag and the bug is invisible.
+_mk_tag_upstream() {
+  up="${TMPDIR_T}/smartwatermelon/tagrepo.git"
+  pusher="${TMPDIR_T}/pusher"
+  walked="${TMPDIR_T}/walkdir/tagrepo"
+  mkdir -p "${up}" "${TMPDIR_T}/walkdir"
+  _GIT_WRAPPER_ACTIVE=1 git -C "${up}" init -q --bare -b main
+  _GIT_WRAPPER_ACTIVE=1 git -c core.hooksPath=/dev/null clone -q "${up}" "${pusher}" 2>/dev/null
+  git -C "${pusher}" config core.hooksPath /dev/null
+  git -C "${pusher}" config user.email t@t
+  git -C "${pusher}" config user.name t
+  git -C "${pusher}" config tag.gpgSign false
+  git -C "${pusher}" config commit.gpgSign false
+  echo one >"${pusher}/f"
+  git -C "${pusher}" add f
+  git -C "${pusher}" commit -qm one
+  git -C "${pusher}" tag v3
+  git -C "${pusher}" push -q origin main v3
+  _GIT_WRAPPER_ACTIVE=1 git -c core.hooksPath=/dev/null clone -q "${up}" "${walked}"
+  git -C "${walked}" config core.hooksPath /dev/null
+  git -C "${walked}" config user.email t@t
+  git -C "${walked}" config user.name t
+  git -C "${walked}" config commit.gpgSign false
+  git -C "${walked}" config fetch.pruneTags true
+}
+
+# Moves v3 to a new commit upstream, the way github-workflows re-points its
+# floating major tags on each release.
+_move_upstream_tag() {
+  echo two >>"${pusher}/f"
+  git -C "${pusher}" add f
+  git -C "${pusher}" commit -qm two
+  git -C "${pusher}" tag -f v3 >/dev/null
+  git -C "${pusher}" push -q -f origin main v3
+}
+
+@test "walk pulls and overwrites a tag that moved upstream" {
+  _mk_tag_upstream
+  _move_upstream_tag
+  want_tag="$(git -C "${up}" rev-parse v3)"
+  want_head="$(git -C "${up}" rev-parse main)"
+  old_tag="$(git -C "${walked}" rev-parse v3)"
+  [ "${old_tag}" != "${want_tag}" ]
+
+  run bash -c "MY_REPOS_DIR='${TMPDIR_T}/walkdir' '${REPO_ROOT}/my-repos.sh'"
+  [ "${status}" -eq 0 ]
+  [[ "${output}" != *"would clobber existing tag"* ]]
+  [[ "${output}" != *"pull failed"* ]]
+  [[ "${output}" == *"Failed: 0"* ]]
+  new_tag="$(git -C "${walked}" rev-parse v3)"
+  new_head="$(git -C "${walked}" rev-parse HEAD)"
+  [ "${new_tag}" = "${want_tag}" ]
+  [ "${new_head}" = "${want_head}" ]
+}
+
+@test "walk still refuses a non-fast-forward branch after the tag fix" {
+  _mk_tag_upstream
+  # Diverge: a local-only commit, then a different upstream commit.
+  echo local >"${walked}/g"
+  git -C "${walked}" add g
+  git -C "${walked}" commit -qm local-only
+  before="$(git -C "${walked}" rev-parse HEAD)"
+  _move_upstream_tag
+
+  run bash -c "MY_REPOS_DIR='${TMPDIR_T}/walkdir' '${REPO_ROOT}/my-repos.sh'"
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"pull failed"* ]]
+  # The failure must come from the divergence, not from the tag.
+  [[ "${output}" != *"would clobber existing tag"* ]]
+  [[ "${output}" == *"Failed: 1"* ]]
+  after="$(git -C "${walked}" rev-parse HEAD)"
+  [ "${after}" = "${before}" ]
+}
+
 @test "parse_args accepts --show-dead-branches and --status" {
   run bash -c "source '${LIB}'; repo_walker_parse_args --status; \
     echo \"\${REPO_WALKER_SHOW_PRS} \${REPO_WALKER_SHOW_ISSUES} \${REPO_WALKER_SHOW_DEAD_BRANCHES}\""
