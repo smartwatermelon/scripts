@@ -1046,9 +1046,11 @@ _mkrepo() {
   _mkrepo "${TMPDIR_T}/walk/moved" git@github.com:smartwatermelon/moved.git
   run bash -c "BASH_ENV='${stub}' MY_REPOS_DIR='${TMPDIR_T}/walk' \
     bash '${REPO_ROOT}/my-repos.sh' --check-remotes 2>&1"
-  # The fake origin cannot be pulled, so the walk exits 1. A mis-pointed
-  # remote alone is report-only and does not affect the status.
+  # The fake origin cannot be pulled, so the walk exits 1 for that reason.
+  # This test cannot prove a mis-pointed remote alone leaves the status at 0:
+  # git remote get-url applies insteadOf, so a reachable fake is not cheap.
   [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Failed: 1"* ]]
   [[ "${output}" == *"Mis-pointed: 1"* ]]
   [[ "${output}" == *"Mis-pointed remotes:"* ]]
   [[ "${output}" == *"Re-run with --fix-remotes"* ]]

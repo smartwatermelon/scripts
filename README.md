@@ -22,8 +22,8 @@ Internal repo; not intended for public consumption.
   sensible default: `MY_REPOS_DIR` (`my-repos.sh`), `BEACON_REPOS_DIR`
   (`beacon-repos.sh`). A missing directory warns and exits 0 rather than
   failing, so `allup` still passes on a machine that legitimately lacks one.
-  A repo that fails its pull makes the walker exit 1; a dirty repo is
-  skipped and does not.
+  A repo that fails its status check, switch, pull or branch restore makes
+  the walker exit 1; a dirty repo is skipped and does not.
 - LaunchAgent plists that invoke these scripts live in
   `~/Developer/LaunchAgents/`, not in this repo. The empty `LaunchAgents/`
   directory here is a placeholder.
