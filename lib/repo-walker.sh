@@ -72,6 +72,10 @@ Options:
                 Matched literally — no globbing.
   --quiet, -q   Suppress per-repo detail; show only summary
   --help, -h    Show this help message and exit
+
+Exit status: 0 when no repo failed (dirty repos are skipped, not failed),
+1 when any repo failed its status check, switch, pull or branch restore,
+2 on a usage error.
 EOF
 }
 
@@ -989,4 +993,10 @@ repo_walker_main() {
       echo "    - ${f}"
     done
   fi
+
+  # allup reads this status. An if, not `&&`: that returns 1 on success.
+  if ((failed > 0)); then
+    return 1
+  fi
+  return 0
 }
