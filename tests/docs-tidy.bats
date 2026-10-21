@@ -24,6 +24,36 @@ setup() {
   export DOCS_TIDY_TODAY=2026-10-21
 }
 
+# Restore permissions that a test removed (chmod 000 / 555), so bats can
+# clean up its temp dir.
+teardown() {
+  chmod -R u+rwx "${BATS_TEST_TMPDIR:?}"
+}
+
+# is_mac: true on macOS, where Finder tags and osascript exist.
+is_mac() {
+  [[ "${OSTYPE}" == darwin* ]]
+}
+
+# settags FILE TAG...: write Finder tags (macOS only).
+settags() {
+  local file="$1" hex
+  shift
+  hex="$(python3 -I -c 'import plistlib, sys; print(plistlib.dumps(sys.argv[1:], fmt=plistlib.FMT_BINARY).hex())' "$@")"
+  xattr -wx com.apple.metadata:_kMDItemUserTags "${hex}" "${file}"
+}
+
+# want_tags FILE EXPECTED: the file's Finder tags as a Python list repr.
+want_tags() {
+  local hex got
+  hex="$(xattr -px com.apple.metadata:_kMDItemUserTags "$1")"
+  got="$(python3 -I -c 'import plistlib, sys; print(plistlib.loads(bytes.fromhex("".join(sys.argv[1].split()))))' "${hex}")"
+  if [ "${got}" != "$2" ]; then
+    printf 'tags: %s\n got: %s\nwant: %s\n' "$1" "${got}" "$2" >&2
+    return 1
+  fi
+}
+
 # mk PATH STAMP [CONTENT]: create a file under DOC with an mtime of STAMP
 # (touch -t format, CCYYMMDDhhmm).
 mk() {
@@ -469,4 +499,129 @@ want_file() {
   [ "${status}" -eq 0 ]
   [[ "${output}" == *"docs-tidy plan 2026-10-21"* ]]
   [[ "${output}" == *"old  newest 2019-01-01"* ]]
+}
+
+@test "credit retag: only a missing canonical tag triggers it, and the user's tags are kept" {
+  if ! is_mac; then skip "Finder tags need macOS"; fi
+  mk "credit-reports/2024-10 Jen Equifax.pdf" 202410010000
+  mk "credit-reports/2024-06 Andrew Experian.pdf" 202406010000
+  settags "${DOC}/credit-reports/2024-10 Jen Equifax.pdf" $'Important\n6' Jen
+  # Canonical tags present (one with a colour suffix) plus a user tag: no retag.
+  settags "${DOC}/credit-reports/2024-06 Andrew Experian.pdf" Andrew $'Experian\n4' Mine
+  run "${SCRIPT}" plan
+  [ "${status}" -eq 0 ]
+  want "[e['rel'] for e in p['entries'] if e['section'] == 'credit']" "['credit-reports/2024-10 Jen Equifax.pdf']"
+  run "${SCRIPT}" apply
+  [ "${status}" -eq 0 ]
+  want_tags "${DOC}/credit-reports/2024-10 Jen Equifax.pdf" "['Important\\n6', 'Jen', 'Equifax']"
+  want_tags "${DOC}/credit-reports/2024-06 Andrew Experian.pdf" "['Andrew', 'Experian\\n4', 'Mine']"
+}
+
+@test "credit rename keeps the file's existing tags and adds the canonical ones" {
+  if ! is_mac; then skip "Finder tags need macOS"; fi
+  mk "credit-reports/AMR experian.pdf" 202406200000
+  settags "${DOC}/credit-reports/AMR experian.pdf" $'Important\n6'
+  run "${SCRIPT}" plan
+  [ "${status}" -eq 0 ]
+  run "${SCRIPT}" apply
+  [ "${status}" -eq 0 ]
+  want_tags "${DOC}/credit-reports/2024-06 Andrew Experian.pdf" "['Important\\n6', 'Andrew', 'Experian']"
+}
+
+@test "credit: a tag write failure is a note on an OK rename, and the rename is logged" {
+  mk "credit-reports/AMR experian.pdf" 202406200000
+  run "${SCRIPT}" plan
+  [ "${status}" -eq 0 ]
+  # Read-only file: the rename still works (the directory is writable) but
+  # xattr cannot write the tags.
+  chmod 444 "${DOC}/credit-reports/AMR experian.pdf"
+  run "${SCRIPT}" apply
+  [ "${status}" -eq 0 ]
+  [ -f "${DOC}/credit-reports/2024-06 Andrew Experian.pdf" ]
+  grep -q "AMR experian.pdf	2024-06 Andrew Experian.pdf	Andrew,Experian" \
+    "${DOC}/credit-reports/.rename-log-2026-10-21.tsv"
+  grep -q "^OK	credit" "${STATE}/apply-2026-10-21.tsv"
+  if is_mac; then
+    grep -q "^OK	credit.*tags not written" "${STATE}/apply-2026-10-21.tsv"
+  fi
+}
+
+@test "snapshot: a file whose unit is being archived is stashed, not merged" {
+  mk "old/a.txt" 201901010000 "alpha"
+  mk "Documents - HOST/old/extra.txt" 201801010000 "only in snapshot"
+  run "${SCRIPT}" plan
+  [ "${status}" -eq 0 ]
+  want_srcs archive "['old/a.txt']"
+  want_srcs snapshot-merge "[]"
+  want "[e['why'] for e in p['entries'] if e['section'] == 'snapshot']" "['unit archived']"
+}
+
+@test "notify passes title and message to osascript as argv and logs a failure" {
+  mkdir -p "${BATS_TEST_TMPDIR}/bin"
+  cat >"${BATS_TEST_TMPDIR}/bin/osascript" <<'SH'
+#!/usr/bin/env bash
+printf '<%s>\n' "$@" >"${BATS_TEST_TMPDIR}/osascript.args"
+exit 3
+SH
+  chmod +x "${BATS_TEST_TMPDIR}/bin/osascript"
+  run env PATH="${BATS_TEST_TMPDIR}/bin:${PATH}" "${SCRIPT}" plan --notify
+  [ "${status}" -eq 0 ]
+  if is_mac; then
+    grep -qx '<on run argv>' "${BATS_TEST_TMPDIR}/osascript.args"
+    grep -qx '<docs-tidy plan 2026-10-21>' "${BATS_TEST_TMPDIR}/osascript.args"
+    grep -q '^<archive 0, ' "${BATS_TEST_TMPDIR}/osascript.args"
+    [[ "${output}" == *"notify failed (osascript exit 3)"* ]]
+  else
+    [[ "${output}" == *"notify: docs-tidy plan 2026-10-21"* ]]
+  fi
+}
+
+@test "apply writes apply-<date>.tsv before the pointer step, so a pointer failure keeps the record" {
+  mk "old/a.txt" 201901010000 "alpha"
+  run "${SCRIPT}" plan
+  [ "${status}" -eq 0 ]
+  # A directory where the pointer file should be makes write_pointer fail.
+  mkdir "${DOC}/ARCHIVED-TO-GOOGLE-DRIVE.txt"
+  run "${SCRIPT}" apply
+  [ "${status}" -ne 0 ]
+  grep -q "^OK	archive	.*old/a.txt" "${STATE}/apply-2026-10-21.tsv"
+}
+
+@test "an unreadable directory is skipped and its unit never archives" {
+  if [[ "${EUID}" -eq 0 ]]; then skip "root can read a chmod 000 directory"; fi
+  mk "old/a.txt" 201901010000
+  mk "old/locked/b.txt" 201901010000
+  mk "old2/a.txt" 201901010000
+  chmod 000 "${DOC}/old/locked"
+  run "${SCRIPT}" plan
+  [ "${status}" -eq 0 ]
+  want_srcs archive "['old2/a.txt']"
+  want "p['skipped']" "[['old/locked', 'unreadable directory']]"
+}
+
+@test "apply skips a unit that gained an unreadable directory after planning" {
+  if [[ "${EUID}" -eq 0 ]]; then skip "root can read a chmod 000 directory"; fi
+  mk "old/a.txt" 201901010000
+  mk "old/sub/b.txt" 201901010000
+  run "${SCRIPT}" plan
+  [ "${status}" -eq 0 ]
+  chmod 000 "${DOC}/old/sub"
+  run "${SCRIPT}" apply
+  [ "${status}" -eq 0 ]
+  [ -f "${DOC}/old/a.txt" ]
+  [[ "${output}" == *"unit has an unreadable directory, skipped: old"* ]]
+}
+
+@test "a failed copy records an error, keeps the source and leaves no destination" {
+  if [[ "${EUID}" -eq 0 ]]; then skip "root can write a read-only directory"; fi
+  mk "old/a.txt" 201901010000 "alpha"
+  run "${SCRIPT}" plan
+  [ "${status}" -eq 0 ]
+  mkdir -p "${ARCHIVE}/old"
+  chmod 555 "${ARCHIVE}/old"
+  run "${SCRIPT}" apply
+  [ "${status}" -eq 1 ]
+  want_file "${DOC}/old/a.txt" "alpha"
+  [ ! -e "${ARCHIVE}/old/a.txt" ]
+  grep -q "^ERR	archive" "${STATE}/apply-2026-10-21.tsv"
 }

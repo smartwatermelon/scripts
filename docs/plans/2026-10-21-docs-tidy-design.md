@@ -63,6 +63,8 @@ The cutoff is 00:00 local on Jan 1 of `(today.year - 4)`. In Oct 2026 that is
 1. List regular files only (`S_ISREG` on `lstat`). Sockets, FIFOs and
    symlinks are reported as skipped and never planned. The 2026-10-21 run
    failed on a git `fsmonitor--daemon.ipc` socket.
+   A directory that cannot be listed (for example mode 000) is reported as
+   skipped ("unreadable directory").
 2. Skip `.DS_Store` and `.localized` everywhere.
 3. MD5 source, in order:
    1. the DriveFS mirror DB (`mirror_item.local_md5_checksum`), when its size
@@ -76,11 +78,16 @@ The cutoff is 00:00 local on Jan 1 of `(today.year - 4)`. In Oct 2026 that is
 1. **archive.** Units are the top-level entries of Documents, except
    dotfiles, `Documents - *`, `credit-reports`, `tax`, the pointer file and
    `KEEP`. Each `tax/<year>` is its own unit. A unit archives when its newest
-   regular-file mtime is before the cutoff. Every file in it maps to
+   regular-file mtime is before the cutoff. A unit that contains an
+   unreadable directory never archives, because it may hold recent files
+   the plan cannot see. Every file in it maps to
    `<Drive>/Documents Archive/<rel>`.
 2. **snapshot.** For each `Documents - <HOST>` folder, check every file
    against the files that stay local after archive:
    - If its MD5 matches a file outside the snapshots, stash it.
+   - If its merge target falls in a unit that this plan archives, stash it
+     (`why` = "unit archived"). Merging it would leave the file behind in a
+     folder that is moving to Drive.
    - If it is unique and `<Documents>/<rel-inside-snapshot>` is absent,
      merge it there (section `snapshot-merge`).
    - If it is unique but that path exists with other content, stash it and
@@ -107,7 +114,7 @@ The cutoff is 00:00 local on Jan 1 of `(today.year - 4)`. In Oct 2026 that is
    `node_modules` or unit rule) planned 245 stashes in 167 groups. 93 were
    under `old-pi`, 51 under `Resume` (per-application template copies), 41
    under `Codex` and 33 in `node_modules`. With these rules the same data
-   gives 19 stashes in 19 groups.
+   gives 18 stashes in 18 groups (with `.workflow` excluded).
 4. **credit.** For files in `credit-reports` (not dotfiles) whose name does
    not match `^\d{4}-\d{2} (Andrew|Jen) (Equifax|Experian|TransUnion)\.pdf$`
    or the request-form names, propose a rename. Use the person and agency
@@ -117,8 +124,10 @@ The cutoff is 00:00 local on Jan 1 of `(today.year - 4)`. In Oct 2026 that is
      name, else the file's mtime.
    - Unparseable names, or names that would collide, go to "needs manual".
      Nothing is planned for them.
-   - Canonical names whose Finder tags differ from `[Person, Agency]` get a
-     retag-only entry.
+   - A canonical name gets a retag-only entry only when one of its canonical
+     tags (`[Person, Agency]`) is missing. Tag names are compared with the
+     Finder colour suffix removed (`"Important\n6"` is `Important`). Extra
+     tags are the user's and never trigger a retag.
 
 The text summary shows counts and bytes per section, every archive unit with
 its newest mtime, every dupe group (kept path, then stashed paths), every
@@ -141,30 +150,48 @@ Per file: copy, verify, delete. This is the pattern proven on 2026-10-21.
 2. If the destination exists with the same MD5, delete the source. If it
    exists with a different MD5, record an error.
 3. Copy with `shutil.copy2`, re-hash the destination, and only then delete
-   the source.
+   the source. If the copy raises or the verification fails, remove the
+   partial destination (it did not exist before this copy) and record an
+   error. The source stays.
 4. A missing source with an existing destination counts as already done.
 
 For archive units, first re-check that the unit's newest mtime is still
-before the cutoff. If not, skip the whole unit and report it.
+before the cutoff and that every directory in it can be read. If not, skip
+the whole unit and report it.
 
 Before copying, call `brctl download` on each dataless source (macOS only).
 On `ETIMEDOUT` (errno 60), call `brctl download` and retry, up to 3 times.
 The 2026-10-21 run lost 9 files to this, and all 9 then copied in 5 s.
 
-Credit entries: `os.rename`, then write tags with `xattr -wx
-com.apple.metadata:_kMDItemUserTags <binary plist hex>` (macOS only; on other
-systems, log that tags were skipped). Append one line per change to
-`credit-reports/.rename-log-<date>.tsv`.
+Credit entries: `os.rename`, and record the rename-log row at once. Then
+write tags with `xattr -wx com.apple.metadata:_kMDItemUserTags <binary plist
+hex>` (macOS only; on other systems, log that tags were skipped). The tags
+written are the file's current tags, in order and with colour suffixes, plus
+any missing canonical tag. A tag-write failure is a note on an OK result,
+not an error, because the rename already happened. Append one line per
+change to `credit-reports/.rename-log-<date>.tsv`.
 
-After the moves:
+After the moves, in this order:
 
+- Write `apply-<date>.tsv` (OK/ERR, section, md5, src, dst, note) to the
+  state dir first, so a failure in a later step cannot lose the record.
+- Append a dated section to `<Documents>/ARCHIVED-TO-GOOGLE-DRIVE.txt`
+  (create it if missing), unless only credit entries changed. When tax
+  years were archived, also append to `<Documents>/tax/ARCHIVED-YEARS.txt`.
+  This runs before cleanup, so `tax/` is not removed as empty when its last
+  year moves.
 - In each source tree that was moved, delete `.DS_Store` and `.localized`.
   Then `rmdir` the empty directories, bottom-up. Never use `rm -rf`, and
   never touch a directory that still holds other files.
-- Append a dated section to `<Documents>/ARCHIVED-TO-GOOGLE-DRIVE.txt`
-  (create it if missing). When tax years were archived, also append to
-  `<Documents>/tax/ARCHIVED-YEARS.txt`.
-- Write `apply-<date>.tsv` (OK/ERR, section, md5, src, dst) to the state dir.
 
 Exit 0 if every entry succeeded, else exit 1 and print a summary of the
 errors.
+
+## Notifications
+
+`post(title, message)` runs `osascript -e 'on run argv' -e 'display
+notification (item 2 of argv) with title (item 1 of argv)' -e 'end run'
+TITLE MESSAGE`. The text goes in as argv, so it needs no AppleScript
+escaping. A nonzero `osascript` exit is logged. Off macOS, the text is
+printed instead. A `plan --notify` that fails posts "docs-tidy plan FAILED"
+with the reason, because nobody reads the launchd log.

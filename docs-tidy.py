@@ -204,14 +204,22 @@ def load_drivefs(doc, dirs):
 
 
 def inventory(doc, drivefs):
-    """Walk Documents. Return (files, skipped).
+    """Walk Documents. Return (files, skipped, unreadable).
 
     files: {rel: dict(size, mtime, dataless, md5, md5_src)}; regular files only.
-    skipped: [(rel, kind)] for symlinks, sockets, FIFOs and devices.
+    skipped: [(rel, kind)] for symlinks, sockets, FIFOs, devices and
+    unreadable directories.
+    unreadable: set of rel paths of directories os.walk could not list.
     """
-    files, skipped = {}, []
+    files, skipped, unreadable = {}, [], set()
     hashed = 0
-    for root, dirs, names in os.walk(doc, followlinks=False):
+
+    def walk_error(err):
+        rel = os.path.relpath(err.filename, doc) if err.filename else "?"
+        unreadable.add(rel)
+        skipped.append((rel, "unreadable directory"))
+
+    for root, dirs, names in os.walk(doc, followlinks=False, onerror=walk_error):
         for d in list(dirs):
             p = os.path.join(root, d)
             if os.path.islink(p):
@@ -244,7 +252,7 @@ def inventory(doc, drivefs):
                     continue
             files[rel] = dict(size=st.st_size, mtime=st.st_mtime, dataless=dataless, md5=md5, md5_src=src)
     skipped.sort()
-    return files, skipped
+    return files, skipped, unreadable
 
 
 def file_kind(mode):
@@ -279,7 +287,10 @@ def under(rel, prefix):
 
 
 def read_tags(path):
-    """Finder tag names (colour suffix stripped), or None when unreadable."""
+    """Raw Finder tags, colour suffix kept (e.g. "Important\\n6").
+
+    None when tags cannot be read on this system; [] when the file has none.
+    """
     if not (IS_MAC and shutil.which("xattr")):
         return None
     r = subprocess.run(["xattr", "-px", TAG_XATTR, path], capture_output=True, text=True)
@@ -289,7 +300,17 @@ def read_tags(path):
         tags = plistlib.loads(bytes.fromhex("".join(r.stdout.split())))
     except Exception:
         return []
-    return [t.split("\n", 1)[0] for t in tags]
+    return [t for t in tags if isinstance(t, str)]
+
+
+def tag_name(tag):
+    return tag.split("\n", 1)[0]
+
+
+def merge_tags(have, canon):
+    """have, in order with colour suffixes, plus any canonical tag it lacks."""
+    names = {tag_name(t) for t in have}
+    return list(have) + [t for t in canon if t not in names]
 
 
 def write_tags(path, tags):
@@ -348,7 +369,7 @@ def parse_credit(name, mtime):
 
 def build_plan(doc, drive, drivefs_dirs, day):
     drivefs = load_drivefs(doc, drivefs_dirs)
-    files, skipped = inventory(doc, drivefs)
+    files, skipped, unreadable = inventory(doc, drivefs)
     cut = cutoff_ts(day)
     date = day.isoformat()
     arch_base = os.path.join(drive, "Documents Archive")
@@ -382,6 +403,9 @@ def build_plan(doc, drive, drivefs_dirs, day):
         members = [r for r in files if under(r, u)]
         if not members:
             continue
+        # A unit we cannot fully read may hold recent files we cannot see.
+        if any(under(d, u) for d in unreadable):
+            continue
         newest = max(files[r]["mtime"] for r in members)
         if newest >= cut:
             continue
@@ -395,6 +419,7 @@ def build_plan(doc, drive, drivefs_dirs, day):
         return top(r).startswith(SNAPSHOT_PREFIX)
 
     local = {r for r in files if r not in archived and not in_snapshot(r)}
+    archived_units = {u["rel"] for u in units}
 
     # 2. snapshots
     outside_md5 = {files[r]["md5"] for r in local if files[r]["md5"]}
@@ -414,6 +439,13 @@ def build_plan(doc, drive, drivefs_dirs, day):
                 continue
             if f["md5"] in outside_md5:
                 entry("snapshot", r, stash_dst, why="dupe")
+                s["stash"] += 1
+                s["stash_bytes"] += f["size"]
+                continue
+            if unit_of(inner) in archived_units:
+                # Merging into a unit that is leaving would strand the file
+                # in a half-archived folder.
+                entry("snapshot", r, stash_dst, why="unit archived")
                 s["stash"] += 1
                 s["stash_bytes"] += f["size"]
                 continue
@@ -491,16 +523,18 @@ def build_plan(doc, drive, drivefs_dirs, day):
             if rel in stashed:
                 continue
             tags = canonical_tags(n)
+            have = read_tags(os.path.join(cdir, n))
             if tags is not None:
-                have = read_tags(os.path.join(cdir, n))
-                if have is not None and sorted(have) != sorted(tags):
+                # Retag only when a canonical tag is missing; the user's own
+                # tags are kept.
+                if have is not None and merge_tags(have, tags) != have:
                     proposals.append((n, n, tags, have))
                 continue
             new, why = parse_credit(n, files[rel]["mtime"])
             if new is None:
                 needs_manual.append((rel, why))
                 continue
-            proposals.append((n, new, why, None))
+            proposals.append((n, new, why, have))
         targets = {}
         for old, new, _tags, _have in proposals:
             targets.setdefault(new, []).append(old)
@@ -619,9 +653,14 @@ def summary(plan):
 
 
 def post(title, msg):
+    """Post a macOS notification. Title and message go in as argv, so no
+    AppleScript string escaping is needed."""
     if IS_MAC and shutil.which("osascript"):
-        script = f"display notification {json.dumps(msg)} with title {json.dumps(title)}"
-        subprocess.run(["osascript", "-e", script], check=False)
+        r = subprocess.run(["osascript", "-e", "on run argv",
+                            "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+                            "-e", "end run", title, msg], check=False, capture_output=True, text=True)
+        if r.returncode != 0:
+            log(f"notify failed (osascript exit {r.returncode}): {r.stderr.strip()}; {title}: {msg}")
     else:
         log(f"notify: {title}: {msg}")
 
@@ -733,35 +772,42 @@ def move_file(e):
         os.remove(src)
         return "OK", h, "destination already had it"
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    for attempt in range(4):
-        try:
-            shutil.copy2(src, dst)
-            break
-        except OSError as ex:
-            if ex.errno not in (60, errno.ETIMEDOUT) or attempt == 3:
-                raise
-            brctl_download(src)
-            time.sleep(1)
-    if md5_file(dst) != h:
-        os.remove(dst)
-        return "ERR", h, "copy verification failed"
+    # dst did not exist (checked above), so any dst after a failure is this
+    # call's partial copy and is safe to remove.
+    try:
+        for attempt in range(4):
+            try:
+                shutil.copy2(src, dst)
+                break
+            except OSError as ex:
+                if ex.errno not in (60, errno.ETIMEDOUT) or attempt == 3:
+                    raise
+                brctl_download(src)
+                time.sleep(1)
+        if md5_file(dst) != h:
+            raise RuntimeError("copy verification failed")
+    except BaseException:
+        if os.path.lexists(dst):
+            os.remove(dst)
+        raise
     os.remove(src)
     return "OK", h, ""
 
 
 def unit_newest(doc, unit):
+    """Return (newest regular-file mtime or None, whether a directory was unreadable)."""
     p = os.path.join(doc, unit)
-    ts = []
     if os.path.isfile(p) and not os.path.islink(p):
-        return os.lstat(p).st_mtime
-    for r, _d, names in os.walk(p):
+        return os.lstat(p).st_mtime, False
+    ts, bad = [], []
+    for r, _d, names in os.walk(p, onerror=bad.append):
         for n in names:
             if n in SKIPNAMES:
                 continue
             st = os.lstat(os.path.join(r, n))
             if stat.S_ISREG(st.st_mode):
                 ts.append(st.st_mtime)
-    return max(ts) if ts else None
+    return (max(ts) if ts else None), bool(bad)
 
 
 def cmd_apply(args):
@@ -804,10 +850,14 @@ def cmd_apply(args):
         bad_units = set()
         if section == "archive":
             for u in sorted({e["unit"] for e in ents}):
-                n = unit_newest(doc, u)
-                if n is not None and n >= cut:
+                n, unreadable = unit_newest(doc, u)
+                if unreadable:
                     bad_units.add(u)
-                    skipped_units.append((u, n))
+                    skipped_units.append((u, "has an unreadable directory"))
+                    log(f"  unit has an unreadable directory, skipped: {u}")
+                elif n is not None and n >= cut:
+                    bad_units.add(u)
+                    skipped_units.append((u, f"newest {fmt_ts(n)}"))
                     log(f"  unit changed since plan, skipped: {u} (newest {fmt_ts(n)})")
         for i, e in enumerate(ents):
             if section == "archive" and e["unit"] in bad_units:
@@ -834,6 +884,14 @@ def cmd_apply(args):
             if (i + 1) % 500 == 0:
                 log(f"  {i + 1}/{len(ents)}  {time.time() - t0:.0f}s")
 
+    # The record of what moved goes to disk first, so a failure in the
+    # pointer or cleanup steps below cannot lose it.
+    sd = state_dir()
+    os.makedirs(sd, exist_ok=True)
+    with open(os.path.join(sd, f"apply-{date}.tsv"), "a") as f:
+        for st, section, h, src, dst, note in results:
+            f.write(f"{st}\t{section}\t{h}\t{src}\t{dst}" + (f"\t{note}" if note else "") + "\n")
+
     ok = [r for r in results if r[0] == "OK"]
     errs = [r for r in results if r[0] == "ERR"]
     # Credit entries rename in place, so they never belong in the pointer.
@@ -852,11 +910,6 @@ def cmd_apply(args):
                 f.write("old_name\tnew_name\ttags\n")
             for row in credit_log:
                 f.write("\t".join(row) + "\n")
-    sd = state_dir()
-    os.makedirs(sd, exist_ok=True)
-    with open(os.path.join(sd, f"apply-{date}.tsv"), "a") as f:
-        for st, section, h, src, dst, note in results:
-            f.write(f"{st}\t{section}\t{h}\t{src}\t{dst}" + (f"\t{note}" if note else "") + "\n")
 
     by = {}
     for st, section, *_ in results:
@@ -865,8 +918,8 @@ def cmd_apply(args):
     for s in SECTIONS:
         if s in by:
             log(f"{s:15} ok {by[s][0]:6}  err {by[s][1]:6}")
-    for u, n in skipped_units:
-        log(f"skipped unit (changed since plan): {u}  newest {fmt_ts(n)}")
+    for u, why in skipped_units:
+        log(f"skipped unit: {u}  ({why})")
     log(f"done in {time.time() - t0:.0f}s; log: {os.path.join(sd, f'apply-{date}.tsv')}")
     if errs:
         log(f"\n{len(errs)} error(s):")
@@ -889,10 +942,19 @@ def apply_credit(e, credit_log):
             if e.get("md5") and md5_file(src) != e["md5"]:
                 return "ERR", "", "source changed since plan"
             os.rename(src, dst)
+            credit_log.append((old, new, ",".join(e["tags"])))
     elif not os.path.exists(dst):
         return "ERR", "", "file missing"
-    tagged = write_tags(dst, e["tags"])
-    credit_log.append((old, new, ",".join(e["tags"])))
+    else:
+        credit_log.append((old, new, ",".join(e["tags"])))
+    # The rename is done; a tag failure is a note on an OK result, not an ERR.
+    have = read_tags(dst)
+    if have is None:
+        have = e.get("old_tags") or []
+    try:
+        tagged = write_tags(dst, merge_tags(have, e["tags"]))
+    except (OSError, subprocess.CalledProcessError) as ex:
+        return "OK", e.get("md5") or "", f"tags not written: {ex}"
     return "OK", e.get("md5") or "", "" if tagged else "tags skipped (not macOS)"
 
 
