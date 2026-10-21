@@ -36,7 +36,7 @@ TAX_POINTER = "ARCHIVED-YEARS.txt"
 CREDIT = "credit-reports"
 SNAPSHOT_PREFIX = "Documents - "
 SKIPNAMES = {".DS_Store", ".localized"}
-SECTIONS = ["archive", "snapshot-merge", "snapshot", "dupes", "credit"]
+SECTIONS = ["archive", "snapshot-merge", "snapshot", "credit"]
 MAX_PLAN_AGE_DAYS = 14
 FREE_RESERVE = 2 * 1024**3
 DUPE_MIN_SIZE = 1024
@@ -461,8 +461,8 @@ def build_plan(doc, drive, drivefs_dirs, day):
             s["stash_bytes"] += f["size"]
             s["superseded"].append(r)
 
-    # 3. dupes
-    # Skip any file inside a git working tree: stashing it breaks the project.
+    # 3. dupes (report only)
+    # Skip any file inside a git working tree: project files repeat by design.
     git_cache = {}
 
     def in_work_tree(r):
@@ -488,23 +488,14 @@ def build_plan(doc, drive, drivefs_dirs, day):
     for r in local:
         if dupe_ok(r):
             groups.setdefault(files[r]["md5"], []).append(r)
-    dupe_groups, stashed = [], set()
+    # Report only, never moved: no rule can tell which copy is in use.
+    dupe_groups = []
     for md5, members in sorted(groups.items(), key=lambda kv: min(kv[1])):
         # Copies inside one unit are deliberate (templates, renamed copies):
         # only copies in different units count as dupes.
         if len({unit_of(r) for r in members}) < 2:
             continue
-        ranked = sorted(members, key=lambda r: (top(r) != CREDIT, top(r) not in KEEP, files[r]["mtime"], len(r), r))
-        keep = ranked[0]
-        # Copies in the keeper's own unit stay with it. KEEP items are
-        # protected: never stash them, even as a duplicate.
-        stash = [r for r in ranked[1:] if unit_of(r) != unit_of(keep) and top(r) not in KEEP]
-        if not stash:
-            continue
-        dupe_groups.append(dict(md5=md5, size=files[keep]["size"], keep=keep, stash=stash))
-        for r in stash:
-            entry("dupes", r, os.path.join(dupe_base, r), keep=keep)
-            stashed.add(r)
+        dupe_groups.append(dict(md5=md5, size=files[members[0]]["size"], copies=sorted(members)))
 
     # 4. credit
     needs_manual, credit = [], []
@@ -520,8 +511,6 @@ def build_plan(doc, drive, drivefs_dirs, day):
             if rel not in files:
                 if os.path.isdir(os.path.join(cdir, n)) and not os.path.islink(os.path.join(cdir, n)):
                     needs_manual.append((rel, "directory"))
-                continue
-            if rel in stashed:
                 continue
             tags = canonical_tags(n)
             have = read_tags(os.path.join(cdir, n))
@@ -588,6 +577,8 @@ def fmt_ts(ts):
 def section_counts(plan):
     c = {s: [0, 0] for s in SECTIONS}
     for e in plan["entries"]:
+        if e["section"] not in c:
+            continue  # a section this version no longer applies
         c[e["section"]][0] += 1
         c[e["section"]][1] += e["size"]
     return c
@@ -623,12 +614,11 @@ def summary(plan):
         for r in s["superseded"]:
             w(f"    superseded {r}")
     w("")
-    w(f"Dupe groups ({len(plan['dupe_groups'])}):")
+    w(f"Duplicate files across folders, report only, never moved ({len(plan['dupe_groups'])} groups):")
     for g in plan["dupe_groups"]:
-        w(f"  {human(g['size'])} x{1 + len(g['stash'])}  {g['md5']}")
-        w(f"    keep   {g['keep']}")
-        for r in g["stash"]:
-            w(f"    stash  {r}")
+        w(f"  {human(g['size'])} x{len(g['copies'])}  {g['md5']}")
+        for r in g["copies"]:
+            w(f"    {r}")
     w("")
     credit = [e for e in plan["entries"] if e["section"] == "credit"]
     w(f"Credit renames ({len(credit)}):")
@@ -669,7 +659,7 @@ def post(title, msg):
 def notify(plan):
     c = section_counts(plan)
     msg = (f"archive {c['archive'][0]}, merge {c['snapshot-merge'][0]}, snapshot {c['snapshot'][0]},"
-           f" dupes {c['dupes'][0]}, credit {c['credit'][0]}. Run: docs-tidy show")
+           f" credit {c['credit'][0]}; {len(plan['dupe_groups'])} dupe groups to review. Run: docs-tidy show")
     post(f"docs-tidy plan {plan['date']}", msg)
 
 
@@ -979,10 +969,9 @@ def write_pointer(plan, ok, date):
     if "snapshot-merge" in by:
         lines.append(f"  snapshot-merge: {len(by['snapshot-merge'])} files that existed only in a machine snapshot,"
                      " merged into this folder at the same relative paths\n")
-    for s, label in (("snapshot", "machine-snapshot files"), ("dupes", "duplicate files")):
-        if s in by:
-            lines.append(f"  {s}: {len(by[s])} {label} to\n"
-                         f"    {os.path.join(drive, 'probably-dupes', plan['date'])}\n")
+    if "snapshot" in by:
+        lines.append(f"  snapshot: {len(by['snapshot'])} machine-snapshot files to\n"
+                     f"    {os.path.join(drive, 'probably-dupes', plan['date'])}\n")
     lines.append("  Every move was copy, verify checksum, then delete the original.\n")
     with open(os.path.join(doc, POINTER), "a") as f:
         f.writelines(lines)

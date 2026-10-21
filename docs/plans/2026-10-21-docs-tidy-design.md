@@ -46,7 +46,7 @@ plists. Doing that in Bash would mean shelling out to Python anyway.
 | Today | local date | `DOCS_TIDY_TODAY` (`YYYY-MM-DD`) |
 
 Archive destination: `<Drive>/Documents Archive/<rel>`.
-Dupes destination: `<Drive>/probably-dupes/<plan date>/<rel>`.
+Snapshot stash destination: `<Drive>/probably-dupes/<plan date>/<rel>`.
 
 `KEEP` is a visible list at the top of the script. These top-level items
 never archive: `army`, `DD214.pdf`, `ssn.pdf`, `Andrew Rich 1989 GED.pdf`,
@@ -93,28 +93,27 @@ The cutoff is 00:00 local on Jan 1 of `(today.year - 4)`. In Oct 2026 that is
    - If it is unique but that path exists with other content, stash it and
      list it as "superseded".
    - If its MD5 is unknown, list it under "needs review" and plan nothing.
-3. **dupes.** Group the files that stay local (not archived, not in
+3. **dupes (report only).** Apply never moves these. Group the files that stay local (not archived, not in
    snapshots) by MD5. Group only files of 1 KiB or larger. Exclude:
    - any path with a `.git` or `node_modules` component, or a component
      ending in `.app`, `.bundle`, `.photoslibrary`, `.rtfd`, `.pages`,
      `.numbers`, `.key` or `.workflow`;
    - any file inside a git working tree: a directory, at any depth, that
-     holds a `.git` entry (directory or file). Stashing one copy out of a
-     project breaks the project.
+     holds a `.git` entry (directory or file). Project files repeat by
+     design.
 
    Copies inside the same unit are deliberate (templates, renamed copies
    such as `airship.png` and `dirigible.png`). A unit is a top-level entry
    of Documents, or `tax/<year>`. A group counts only when its copies span
-   two or more units. Keep one copy: anything in `credit-reports` wins,
-   then a `KEEP` item, then the earliest mtime, then the shortest path,
-   then lexical order. Stash the copies in other units. Copies in the
-   keeper's own unit stay, and `KEEP` items are never stashed.
+   two or more units. The summary lists every copy in each group.
 
-   Why: on the 2026-10-21 dry run, the first rule set (no working-tree,
-   `node_modules` or unit rule) planned 245 stashes in 167 groups. 93 were
-   under `old-pi`, 51 under `Resume` (per-application template copies), 41
-   under `Codex` and 33 in `node_modules`. With these rules the same data
-   gives 18 stashes in 18 groups (with `.workflow` excluded).
+   Why report only: no rule can tell which copy is the one in use. An
+   earlier version kept the earliest-mtime copy and stashed the rest. On
+   the 2026-10-21 dry run that would have kept a write-up in a scratch
+   `Codex` output folder and stashed the copy in `Beacon Biosignals`, and
+   taken 7 files out of a deliberately assembled HELOC packet. Real
+   duplicate clutter came from machine snapshots, which the snapshot
+   section handles.
 4. **credit.** For files in `credit-reports` (not dotfiles) whose name does
    not match `^\d{4}-\d{2} (Andrew|Jen) (Equifax|Experian|TransUnion)\.pdf$`
    or the request-form names, propose a rename. Use the person and agency
@@ -130,7 +129,7 @@ The cutoff is 00:00 local on Jan 1 of `(today.year - 4)`. In Oct 2026 that is
      tags are the user's and never trigger a retag.
 
 The text summary shows counts and bytes per section, every archive unit with
-its newest mtime, every dupe group (kept path, then stashed paths), every
+its newest mtime, every dupe group (all copies), every
 snapshot merge, every credit rename, and the skipped, needs-review and
 needs-manual lists.
 

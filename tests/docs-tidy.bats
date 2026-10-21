@@ -189,7 +189,7 @@ want_file() {
   want_srcs archive "[]"
 }
 
-@test "dupes: credit-reports wins, then earliest mtime" {
+@test "dupes: cross-folder copies are reported with every copy, never planned to move" {
   mkbig "a/one.bin" 202405010000 x
   mkbig "b/two.bin" 202305010000 x
   mkbig "c/three.bin" 202305010000 x
@@ -197,10 +197,23 @@ want_file() {
   mkbig "other/r.pdf" 202301010000 y
   run "${SCRIPT}" plan
   [ "${status}" -eq 0 ]
-  want "len(p['dupe_groups'])" "2"
-  want "sorted(g['keep'] for g in p['dupe_groups'])" "['b/two.bin', 'credit-reports/r.pdf']"
-  want_srcs dupes "['a/one.bin', 'c/three.bin', 'other/r.pdf']"
-  want "[e['dst'] for e in p['entries'] if e['rel'] == 'a/one.bin'][0]" "${STASH}/a/one.bin"
+  want "[g['copies'] for g in p['dupe_groups']]" \
+    "[['a/one.bin', 'b/two.bin', 'c/three.bin'], ['credit-reports/r.pdf', 'other/r.pdf']]"
+  want "len(p['entries'])" "0"
+  run "${SCRIPT}" show
+  [[ "${output}" == *"report only, never moved (2 groups)"* ]]
+}
+
+@test "apply never moves duplicate files" {
+  mkbig "a/one.bin" 202301010000 x
+  mkbig "b/c/two.bin" 202401010000 x
+  run "${SCRIPT}" plan
+  [ "${status}" -eq 0 ]
+  run "${SCRIPT}" apply
+  [ "${status}" -eq 0 ]
+  [ -f "${DOC}/a/one.bin" ]
+  [ -f "${DOC}/b/c/two.bin" ]
+  [ ! -e "${DRIVE}/probably-dupes" ]
 }
 
 @test "dupes: .git paths, small files and bundles are excluded" {
@@ -217,7 +230,6 @@ want_file() {
   run "${SCRIPT}" plan
   [ "${status}" -eq 0 ]
   want "len(p['dupe_groups'])" "0"
-  want_srcs dupes "[]"
 }
 
 @test "dupes: files inside a git working tree are excluded, at any depth" {
@@ -234,7 +246,7 @@ want_file() {
   mkbig "plain2/data.bin" 202601010000 v
   run "${SCRIPT}" plan
   [ "${status}" -eq 0 ]
-  want_srcs dupes "['plain2/data.bin']"
+  want "[g['copies'] for g in p['dupe_groups']]" "[['plain/src/data.bin', 'plain2/data.bin']]"
 }
 
 @test "dupes: node_modules paths are excluded" {
@@ -255,17 +267,7 @@ want_file() {
   run "${SCRIPT}" plan
   [ "${status}" -eq 0 ]
   # Only the tax pair spans two units (tax/2024 and tax/2025).
-  want_srcs dupes "['tax/2025/form.pdf']"
-}
-
-@test "dupes: copies in the keeper's unit stay; copies in other units are stashed" {
-  mkbig "a/one.bin" 202301010000 x
-  mkbig "a/one-copy.bin" 202401010000 x
-  mkbig "b/two.bin" 202402010000 x
-  run "${SCRIPT}" plan
-  [ "${status}" -eq 0 ]
-  want "[g['keep'] for g in p['dupe_groups']]" "['a/one.bin']"
-  want_srcs dupes "['b/two.bin']"
+  want "[g['copies'] for g in p['dupe_groups']]" "[['tax/2024/form.pdf', 'tax/2025/form.pdf']]"
 }
 
 @test "credit: names are parsed into renames; an unparseable name needs manual" {
@@ -382,16 +384,16 @@ want_file() {
 
 @test "apply records an error and keeps the source when it changed after planning" {
   mkbig "a/keep.bin" 202301010000 x
-  mkbig "b/stash.bin" 202401010000 x
+  mkbig "Documents - HOST/a/keep.bin" 202401010000 x
   run "${SCRIPT}" plan
   [ "${status}" -eq 0 ]
-  want_srcs dupes "['b/stash.bin']"
-  printf 'edited' >>"${DOC}/b/stash.bin"
+  want_srcs snapshot "['Documents - HOST/a/keep.bin']"
+  printf 'edited' >>"${DOC}/Documents - HOST/a/keep.bin"
   run "${SCRIPT}" apply
   [ "${status}" -eq 1 ]
-  [ -f "${DOC}/b/stash.bin" ]
-  [ ! -e "${STASH}/b/stash.bin" ]
-  grep -q '^ERR	dupes' "${STATE}/apply-2026-10-21.tsv"
+  [ -f "${DOC}/Documents - HOST/a/keep.bin" ]
+  [ ! -e "${STASH}/Documents - HOST/a/keep.bin" ]
+  grep -q '^ERR	snapshot' "${STATE}/apply-2026-10-21.tsv"
   [[ "${output}" == *"source changed since plan"* ]]
 }
 
@@ -430,20 +432,6 @@ want_file() {
   want_file "${ARCHIVE}/old/a.txt" "different"
 }
 
-@test "--skip dupes leaves dupes in place" {
-  mkbig "a/keep.bin" 202301010000 x
-  mkbig "b/stash.bin" 202401010000 x
-  mk "old/a.txt" 201901010000
-  run "${SCRIPT}" plan
-  [ "${status}" -eq 0 ]
-  run "${SCRIPT}" apply --skip dupes
-  [ "${status}" -eq 0 ]
-  [ -f "${DOC}/a/keep.bin" ]
-  [ -f "${DOC}/b/stash.bin" ]
-  [ ! -e "${DRIVE}/probably-dupes" ]
-  [ ! -e "${DOC}/old" ]
-}
-
 @test "apply renames credit reports and writes the rename log" {
   mk "credit-reports/20240615 AMR Experian report.pdf" 202406150000 "pdf"
   run "${SCRIPT}" plan
@@ -458,31 +446,21 @@ want_file() {
   [ ! -e "${DOC}/ARCHIVED-TO-GOOGLE-DRIVE.txt" ]
 }
 
-@test "apply of dupes rmdirs the emptied parent but not an untouched sibling" {
-  mkbig "a/keep.bin" 202301010000 x
-  mkbig "b/c/stash.bin" 202401010000 x
-  mk "b/c/.DS_Store" 202401010000 "junk"
-  mk "b/sibling/.DS_Store" 202401010000 "junk"
+@test "--skip repeats to skip more than one section" {
+  mk "old/a.txt" 201901010000
+  mk "credit-reports/20240615 AMR Experian report.pdf" 202406150000 "pdf"
   run "${SCRIPT}" plan
   [ "${status}" -eq 0 ]
-  run "${SCRIPT}" apply
+  run "${SCRIPT}" apply --skip credit --skip archive
   [ "${status}" -eq 0 ]
-  [ -f "${STASH}/b/c/stash.bin" ]
-  [ ! -e "${DOC}/b/c" ]
-  [ -f "${DOC}/b/sibling/.DS_Store" ]
-  [ -f "${DOC}/a/keep.bin" ]
+  [ -f "${DOC}/old/a.txt" ]
+  [ -f "${DOC}/credit-reports/20240615 AMR Experian report.pdf" ]
 }
 
-@test "--skip repeats to skip more than one section" {
-  mkbig "a/keep.bin" 202301010000 x
-  mkbig "b/stash.bin" 202401010000 x
-  mk "old/a.txt" 201901010000
-  run "${SCRIPT}" plan
-  [ "${status}" -eq 0 ]
-  run "${SCRIPT}" apply --skip dupes --skip archive
-  [ "${status}" -eq 0 ]
-  [ -f "${DOC}/b/stash.bin" ]
-  [ -f "${DOC}/old/a.txt" ]
+@test "--skip dupes is rejected: dupes are report only" {
+  run "${SCRIPT}" apply --skip dupes
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"invalid choice"* ]]
 }
 
 @test "--skip rejects an unknown section" {
