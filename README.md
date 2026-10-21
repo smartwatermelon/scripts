@@ -24,9 +24,10 @@ Internal repo; not intended for public consumption.
   failing, so `allup` still passes on a machine that legitimately lacks one.
   A repo that fails its status check, switch, pull or branch restore makes
   the walker exit 1; a dirty repo is skipped and does not.
-- LaunchAgent plists that invoke these scripts live in
-  `~/Developer/LaunchAgents/`, not in this repo. The empty `LaunchAgents/`
-  directory here is a placeholder.
+- LaunchAgent plists for scripts in this repo live in `LaunchAgents/` here
+  and are symlinked into `~/Library/LaunchAgents/`. Plists for scripts
+  outside any repo live in `~/Developer/LaunchAgents/`. `CLAUDE.md` has the
+  full placement rule.
 - Practice/standards reference: `CLAUDE.md` (same dir). Design docs:
   `docs/plans/`.
 
@@ -55,6 +56,7 @@ Internal repo; not intended for public consumption.
 | Script | Purpose |
 | --- | --- |
 | `smb-mount.sh` | Idempotent SMB auto-mounter for the ASIAGO workstation. Mounts `romano` via `mount_smbfs` + 1Password, and `mimolette` via `osascript 'mount volume'` (routes through Apple-ID SSO / NetAuth) + managed `~/workspaces` symlink. LaunchAgent cadence 150 s. Design: [`docs/plans/2026-04-16-smb-mount-rebuild-design.md`](docs/plans/2026-04-16-smb-mount-rebuild-design.md). |
+| `docs-tidy.py` | Quarterly `~/Documents` tidy, plan then approve. `plan` writes a plan to `~/.local/state/docs-tidy/`: archive items unchanged for four calendar years to Google Drive, de-duplicate `Documents - <HOST>` machine snapshots, stash duplicate files, and rename and tag credit reports. Nothing moves until `docs-tidy apply` (copy, verify MD5, delete; `--skip SECTION`). `show` prints the newest plan. Python, stdlib only. Runs under `LaunchAgents/com.asiago.docs-tidy.plist` (`plan --notify`, 10:00 on Jan/Apr/Jul/Oct 1). Design: [`docs/plans/2026-10-21-docs-tidy-design.md`](docs/plans/2026-10-21-docs-tidy-design.md). Tests in `tests/docs-tidy.bats`. |
 | `check-certs.sh` | Given a hostname list (defaults to `/tmp/dns-names.txt`), reports DNS resolution and HTTPS certificate validity for each. |
 
 ### Credentials & automation
@@ -89,7 +91,7 @@ Internal repo; not intended for public consumption.
   `my-repos.sh` and `beacon-repos.sh`.
 - `docs/plans/` — design docs and specs for non-trivial scripts.
 - `tests/` — `bats` test suites and fixtures (`ssh-wrapper.bats`).
-- `LaunchAgents/` — placeholder only; active plists live in `~/Developer/LaunchAgents/`.
+- `LaunchAgents/` — plists for scripts in this repo, symlinked into `~/Library/LaunchAgents/` (see `CLAUDE.md`).
 - `.github/workflows/` — `claude-blocking-review.yml`, `dependabot-auto-merge.yml` (PR-review automation and dependabot auto-merge). Scheduled ralph-burndown automation moved to a LaunchAgent on mimolette.local.
 
 ## Standards
