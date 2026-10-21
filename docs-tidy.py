@@ -295,11 +295,12 @@ def read_tags(path):
         return None
     r = subprocess.run(["xattr", "-px", TAG_XATTR, path], capture_output=True, text=True)
     if r.returncode != 0:
-        return []
+        # A missing xattr means no tags; any other failure means unknown.
+        return [] if "No such xattr" in r.stderr else None
     try:
         tags = plistlib.loads(bytes.fromhex("".join(r.stdout.split())))
     except Exception:
-        return []
+        return None
     return [t for t in tags if isinstance(t, str)]
 
 
@@ -797,6 +798,9 @@ def move_file(e):
 def unit_newest(doc, unit):
     """Return (newest regular-file mtime or None, whether a directory was unreadable)."""
     p = os.path.join(doc, unit)
+    if not os.path.lexists(p):
+        # Already moved (a re-run): not unreadable; move_file handles it.
+        return None, False
     if os.path.isfile(p) and not os.path.islink(p):
         return os.lstat(p).st_mtime, False
     ts, bad = [], []
@@ -891,6 +895,14 @@ def cmd_apply(args):
     with open(os.path.join(sd, f"apply-{date}.tsv"), "a") as f:
         for st, section, h, src, dst, note in results:
             f.write(f"{st}\t{section}\t{h}\t{src}\t{dst}" + (f"\t{note}" if note else "") + "\n")
+    if credit_log:
+        lp = os.path.join(doc, CREDIT, f".rename-log-{date}.tsv")
+        new = not os.path.exists(lp)
+        with open(lp, "a") as f:
+            if new:
+                f.write("old_name\tnew_name\ttags\n")
+            for row in credit_log:
+                f.write("\t".join(row) + "\n")
 
     ok = [r for r in results if r[0] == "OK"]
     errs = [r for r in results if r[0] == "ERR"]
@@ -902,14 +914,6 @@ def cmd_apply(args):
         write_pointer(plan, moved, date)
     for root in sorted(moved_roots, key=len, reverse=True):
         cleanup_tree(root, doc)
-    if credit_log:
-        lp = os.path.join(doc, CREDIT, f".rename-log-{date}.tsv")
-        new = not os.path.exists(lp)
-        with open(lp, "a") as f:
-            if new:
-                f.write("old_name\tnew_name\ttags\n")
-            for row in credit_log:
-                f.write("\t".join(row) + "\n")
 
     by = {}
     for st, section, *_ in results:

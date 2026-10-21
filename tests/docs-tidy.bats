@@ -578,6 +578,7 @@ SH
 
 @test "apply writes apply-<date>.tsv before the pointer step, so a pointer failure keeps the record" {
   mk "old/a.txt" 201901010000 "alpha"
+  mk "credit-reports/20240615 AMR Experian report.pdf" 202406150000 "pdf"
   run "${SCRIPT}" plan
   [ "${status}" -eq 0 ]
   # A directory where the pointer file should be makes write_pointer fail.
@@ -585,6 +586,20 @@ SH
   run "${SCRIPT}" apply
   [ "${status}" -ne 0 ]
   grep -q "^OK	archive	.*old/a.txt" "${STATE}/apply-2026-10-21.tsv"
+  # The credit rename log is written before the pointer step too.
+  grep -q "2024-06 Andrew Experian.pdf" "${DOC}/credit-reports/.rename-log-2026-10-21.tsv"
+}
+
+@test "re-applying a finished plan counts moved archive units as done" {
+  mk "old/a.txt" 201901010000 "alpha"
+  run "${SCRIPT}" plan
+  [ "${status}" -eq 0 ]
+  run "${SCRIPT}" apply
+  [ "${status}" -eq 0 ]
+  [ ! -e "${DOC}/old" ]
+  run "${SCRIPT}" apply
+  [ "${status}" -eq 0 ]
+  [[ "${output}" != *"unreadable"* ]]
 }
 
 @test "an unreadable directory is skipped and its unit never archives" {
