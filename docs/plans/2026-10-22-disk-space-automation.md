@@ -90,6 +90,14 @@ the threshold (default 40 GiB, first argument overrides), post a macOS
 notification with `osascript`. 40 GiB, not 50, so the alert does not fire on a
 shortfall the 50 GiB snapshot thinner clears on its own. It deletes nothing.
 
+- An unreadable volume also posts a notification and exits 1, so the alert
+  cannot fail silently on its own input.
+- The title and message reach AppleScript as `argv`, not as script text, so
+  no value can change the script.
+- `osascript` exits 0 even when the notification service is unreachable (seen
+  inside the Claude Code sandbox on 2026-10-23), so a missing notification
+  is not always detected. The log line is the record.
+
 ## Later, separate PR
 
 ### Move `thin-timemachine-snapshots` into this repo, run it daily
