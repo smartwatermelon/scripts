@@ -14,6 +14,7 @@ DF_BIN="${DF_BIN:-$(command -v df || true)}"
 # coreutils; without it the step skips.
 TIMEOUT_BIN="${TIMEOUT_BIN:-$(command -v timeout || command -v gtimeout || true)}"
 SIMCTL_TIMEOUT_SECONDS="${SIMCTL_TIMEOUT_SECONDS:-120}"
+SIMCTL_KILL_GRACE_SECONDS=10
 
 # Free space is logged for the Data volume; / is the read-only system volume.
 DATA_VOLUME="${DATA_VOLUME:-/System/Volumes/Data}"
@@ -100,11 +101,15 @@ function step_simctl() {
     log_info "simctl: timeout/gtimeout not found, skipping rather than running simctl unbounded"
     return "${STEP_SKIPPED}"
   fi
-  log_info "simctl: delete unavailable (timeout ${SIMCTL_TIMEOUT_SECONDS}s)"
+  log_info "simctl: delete unavailable (timeout ${SIMCTL_TIMEOUT_SECONDS}s, kill after ${SIMCTL_KILL_GRACE_SECONDS}s grace)"
   local rc=0
-  "${TIMEOUT_BIN}" "${SIMCTL_TIMEOUT_SECONDS}" "${XCRUN_BIN}" simctl delete unavailable || rc=$?
+  "${TIMEOUT_BIN}" -k "${SIMCTL_KILL_GRACE_SECONDS}s" "${SIMCTL_TIMEOUT_SECONDS}" "${XCRUN_BIN}" simctl delete unavailable || rc=$?
   if ((rc == 124)); then
     log_error "simctl: timed out after ${SIMCTL_TIMEOUT_SECONDS}s"
+    return "${STEP_FAILED}"
+  elif ((rc == 137)); then
+    # 137 is SIGKILL: from timeout -k, or from outside (OOM). GNU timeout gives 137 for both.
+    log_error "simctl: killed (exit 137): timed out after ${SIMCTL_TIMEOUT_SECONDS}s and ignored SIGTERM for ${SIMCTL_KILL_GRACE_SECONDS}s, or killed from outside"
     return "${STEP_FAILED}"
   elif ((rc != 0)); then
     log_error "simctl: delete unavailable failed (exit ${rc})"

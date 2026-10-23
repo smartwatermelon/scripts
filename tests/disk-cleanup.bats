@@ -42,6 +42,7 @@ EOF
 echo "timeout $*" >>"${CALLS}"
 rc_file="$(dirname "$0")/timeout.rc"
 if [[ -f "${rc_file}" ]]; then exit "$(cat "${rc_file}")"; fi
+if [[ "${1}" == "-k" ]]; then shift 2; fi
 shift
 exec "$@"
 EOF
@@ -183,12 +184,12 @@ _fail() {
 # simctl runs under timeout
 # ---------------------------------------------------------------------------
 
-@test "simctl is wrapped in timeout with SIMCTL_TIMEOUT_SECONDS" {
+@test "simctl gets a 10-second SIGKILL grace period after its timeout" {
   run step_simctl
   [ "${status}" -eq 0 ]
-  grep -qx "timeout 7 ${STUBS}/xcrun simctl delete unavailable" "${CALLS}"
+  grep -qx "timeout -k 10s 7 ${STUBS}/xcrun simctl delete unavailable" "${CALLS}"
   # The timeout call comes first: xcrun ran through it, not beside it.
-  [ "$(head -n 1 "${CALLS}")" = "timeout 7 ${STUBS}/xcrun simctl delete unavailable" ]
+  [ "$(head -n 1 "${CALLS}")" = "timeout -k 10s 7 ${STUBS}/xcrun simctl delete unavailable" ]
 }
 
 @test "a simctl timeout (exit 124) is a failure that says it timed out" {
@@ -196,6 +197,13 @@ _fail() {
   run step_simctl
   [ "${status}" -eq "${STEP_FAILED}" ]
   [[ "${output}" == *"simctl: timed out after 7s"* ]]
+}
+
+@test "a simctl SIGKILL (exit 137) is a failure that names both causes" {
+  _fail timeout 137
+  run step_simctl
+  [ "${status}" -eq "${STEP_FAILED}" ]
+  [[ "${output}" == *"simctl: killed (exit 137): timed out after 7s and ignored SIGTERM for 10s, or killed from outside"* ]]
 }
 
 @test "no timeout binary skips simctl rather than running it unbounded" {
