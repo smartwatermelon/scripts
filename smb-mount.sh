@@ -60,7 +60,8 @@ SHARE_MOUNTS=(
   "${HOME}/workspaces"
 )
 SHARE_OP_REFS=(
-  "op://Personal/Synology NAS - dsadmin/password"
+  # 1Password vault "Private", by ID so a rename cannot break it.
+  "op://bg5mciyy25cearfepehuh6nwmi/Synology NAS - dsadmin/password"
   ""
 )
 SHARE_KC_REFS=(
