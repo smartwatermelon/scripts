@@ -40,6 +40,7 @@ Internal repo; not intended for public consumption.
 | `reset-tccd.sh` | Resets the macOS TCC daemon (Transparency, Consent, and Control) and waits for it to respawn. Used when privacy-permission state gets wedged. |
 | `local-macs.sh` | Lists ssh-able Macs on the LAN (Bonjour `_ssh._tcp`, 3-second browse), excluding this host and any name with a space. |
 | `allup-fleet.sh` | Runs `allup` on every host from `local-macs` at once, one tmux pane per host via `ssh -t` — so each remote run stays interactive (casks, macOS updates, sudo prompts) and its output stays separate. `-d` starts without attaching; any other arguments replace `allup` as the remote command. Tests in `tests/allup-fleet.bats`. |
+| `disk-cleanup.sh` | Weekly cache cleanup for the data volume. It runs `npm cache clean --force`, `uv cache prune` and `xcrun simctl delete unavailable`. The simctl step runs under `timeout` (120 s) and skips if there is no `timeout` or `gtimeout`. The script deletes no path itself; each tool cleans its own cache. A missing tool is a logged skip. A failed step does not stop the others, but the run then exits 1. It logs free space before and after. Runs under `LaunchAgents/com.asiago.disk-cleanup.plist` (Sunday 04:00) and logs to `~/.local/state/disk-cleanup.out`. Design: [`docs/plans/2026-10-22-disk-space-automation.md`](docs/plans/2026-10-22-disk-space-automation.md). Tests in `tests/disk-cleanup.bats`. |
 | `tm-caffeinate.sh` | Keeps the machine awake while Time Machine is backing up. LaunchAgent-driven: re-execs under `caffeinate` and polls until the backup completes, then exits. |
 
 ### Development workflow
@@ -92,7 +93,7 @@ Internal repo; not intended for public consumption.
 - `docs/plans/` — design docs and specs for non-trivial scripts.
 - `tests/` — `bats` test suites and fixtures (`ssh-wrapper.bats`).
 - `LaunchAgents/` — plists for scripts in this repo, symlinked into `~/Library/LaunchAgents/` (see `CLAUDE.md`).
-- `.github/workflows/` — `claude-blocking-review.yml`, `dependabot-auto-merge.yml` (PR-review automation and dependabot auto-merge). Scheduled ralph-burndown automation moved to a LaunchAgent on mimolette.local.
+- `.github/workflows/` — `bats.yml` (bats suites and shellcheck), `standards-check.yml`, `auto-tag.yml` (tags each push to main) and `dependabot-auto-merge.yml`. The scheduled ralph-burndown automation is no longer in operation.
 
 ## Standards
 
