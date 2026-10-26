@@ -122,6 +122,11 @@ EOF
   [ "${output}" = "/opt/homebrew/bin/rclone" ]
 }
 
+@test "the default local folder is under ~/.local/state, which the sandbox allows" {
+  run env -u HANDOFF_LOCAL_DIR HOME="${TMPDIR_T}/home" bash -c "source '${REPO_ROOT}/handoff-sync.sh'; echo \"\${HANDOFF_LOCAL_DIR}\""
+  [ "${output}" = "${TMPDIR_T}/home/.local/state/claude-handoffs" ]
+}
+
 @test "sourcing the script does not run main" {
   [ "$(type -t main)" = "function" ]
   [ ! -e "${RCLONE_ARGS}" ]

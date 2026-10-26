@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Two-way sync of ~/.claude/handoffs with Drive "Claude Handoff". TILSIT cron, every 5 min: no GUI session there for a LaunchAgent.
+# Two-way sync of ~/.local/state/claude-handoffs with Drive "Claude Handoff". TILSIT cron, every 5 min: no GUI there for a LaunchAgent.
 
 # Auth errors in the log: rclone's shared client_id is likely retired. Fix with: rclone config reconnect gdrive:
 
 # Full path, not command -v: cron's PATH lacks /opt/homebrew/bin. Tests stub it; empty or non-executable = missing.
 RCLONE_BIN="${RCLONE_BIN:-/opt/homebrew/bin/rclone}"
 
-HANDOFF_LOCAL_DIR="${HANDOFF_LOCAL_DIR:-${HOME}/.claude/handoffs}"
+# Not under ~/.claude: the Claude Code sandbox denies writes there, so a skill could not save a handoff (claude-config#779).
+
+# After moving this dir, run bisync once by hand with --resync: rclone keys its sync state on the path pair.
+HANDOFF_LOCAL_DIR="${HANDOFF_LOCAL_DIR:-${HOME}/.local/state/claude-handoffs}"
 HANDOFF_REMOTE="${HANDOFF_REMOTE:-gdrive:Claude Handoff}"
 HANDOFF_LOG_DIR="${HANDOFF_LOG_DIR:-${HOME}/.local/state/rclone}"
 
