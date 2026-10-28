@@ -19,13 +19,6 @@ set -euo pipefail
 
 REPO="${XDG_DATA_HOME:-${HOME}/.local/share}/claude-config-backup"
 
-# Tracked files: "<destination path inside repo>|<absolute source path>"
-# Add a line here to track another file.
-TRACKED=(
-  "desktop/claude_desktop_config.json|${HOME}/Library/Application Support/Claude/claude_desktop_config.json"
-  "cli/claude.json|${HOME}/.claude/.claude.json"
-)
-
 # Seconds to wait between the two stat samples used for the quiescence check.
 SETTLE_SECONDS="${SETTLE_SECONDS:-5}"
 
@@ -34,6 +27,49 @@ log() {
   ts="$(date '+%Y-%m-%d %H:%M:%S')"
   echo "[${ts}] $*"
 }
+
+# Host label = this machine's top-level folder. hostname -s, not scutil (wrong inside the sandbox); the env var is for tests.
+_host_short() { hostname -s 2>/dev/null || true; }
+_current_user() { id -un 2>/dev/null || true; }
+_upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+
+host_from_env="${CLAUDE_CONFIG_BACKUP_HOST:-}"
+host_short="$(_host_short)"
+host_short="$(_upper "${host_short}")"
+host_env_upper="$(_upper "${host_from_env}")"
+login="$(_current_user)"
+
+# arich-mac's company config must never reach this personal repo. Either signal refuses: host name or the "arich" login.
+if [[ "${host_env_upper}" == ARICH-MAC* || "${host_short}" == ARICH-MAC* \
+  || "${login}" == "arich" ]]; then
+  log "ERROR: this looks like arich-mac (company machine); refusing to back up company config to a personal repo"
+  exit 1
+fi
+
+if [[ -n "${host_from_env}" ]]; then
+  HOST_LABEL="${host_from_env}"
+else
+  HOST_LABEL="${host_short}"
+fi
+if [[ -z "${HOST_LABEL}" ]]; then
+  log "ERROR: no host label; set CLAUDE_CONFIG_BACKUP_HOST (e.g. ASIAGO) in the LaunchAgent"
+  exit 1
+fi
+# Uppercase letters, digits and '-' only: never empty, never '/' or '..'.
+if [[ ! "${HOST_LABEL}" =~ ^[A-Z0-9][A-Z0-9-]*$ ]]; then
+  log "ERROR: invalid host label '${HOST_LABEL}' (allowed: A-Z, 0-9 and '-', not leading); set CLAUDE_CONFIG_BACKUP_HOST"
+  exit 1
+fi
+
+# "<repo path>|<source path>", all under ${HOST_LABEL}/. machine-settings.json is claude-wrapper's --settings overlay, in no other repo.
+TRACKED=(
+  "${HOST_LABEL}/desktop/claude_desktop_config.json|${HOME}/Library/Application Support/Claude/claude_desktop_config.json"
+  "${HOST_LABEL}/cli/claude.json|${HOME}/.claude/.claude.json"
+  "${HOST_LABEL}/machine-settings.json|${CLAUDE_MACHINE_SETTINGS:-${HOME}/.config/claude-code/machine-settings.json}"
+)
+
+# Folders that lived at the repo root before the host-prefixed layout.
+LEGACY_DIRS=(cli desktop)
 
 if ! command -v git >/dev/null 2>&1; then
   log "ERROR: git not found on PATH"
@@ -180,6 +216,47 @@ if [[ ! -d "${REPO}/.git" ]]; then
   log "Initialize it first (see repo README)."
   exit 1
 fi
+
+# One-time move of the root-level layout into ${HOST_LABEL}/: a git mv, so history follows. GIT_BIN lets tests stub it.
+_git_mv() { "${GIT_BIN:-git}" -C "${REPO}" mv -- "$1" "$2"; }
+
+_migrate_legacy_layout() {
+  local d have_old=() clash=()
+  for d in "${LEGACY_DIRS[@]}"; do
+    [[ -d "${REPO}/${d}" ]] || continue
+    have_old+=("${d}")
+    [[ -e "${REPO}/${HOST_LABEL}/${d}" ]] && clash+=("${d}")
+  done
+  [[ "${#have_old[@]}" -eq 0 ]] && return 0
+
+  if [[ "${#clash[@]}" -gt 0 ]]; then
+    log "ERROR: both old and new layout present for: ${clash[*]} (root and ${HOST_LABEL}/); refusing to migrate or back up"
+    log "  Resolve by hand in ${REPO}: keep one copy of each, commit, then re-run."
+    exit 1
+  fi
+  if ! git -C "${REPO}" diff --cached --quiet; then
+    log "ERROR: index of ${REPO} has staged changes; refusing to migrate the layout on top of them"
+    exit 1
+  fi
+
+  mkdir -p "${REPO}/${HOST_LABEL}"
+  for d in "${have_old[@]}"; do
+    if ! _git_mv "${d}" "${HOST_LABEL}/${d}"; then
+      log "ERROR: git mv ${d} ${HOST_LABEL}/${d} failed; inspect ${REPO} by hand"
+      exit 1
+    fi
+  done
+  if git -C "${REPO}" diff --cached --quiet; then
+    log "migrated layout: nothing tracked to move for ${have_old[*]}"
+    return 0
+  fi
+  git -C "${REPO}" commit --quiet \
+    -m "layout: move ${have_old[*]} into ${HOST_LABEL}/" \
+    -m "One-time move to the host-prefixed layout by claude-config-backup.sh; each host now writes only its own folder."
+  log "migrated layout: moved ${have_old[*]} into ${HOST_LABEL}/"
+}
+
+_migrate_legacy_layout
 
 copied=0
 skipped=0
