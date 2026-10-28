@@ -242,25 +242,107 @@ for entry in "${TRACKED[@]}"; do
   [[ -f "${REPO}/${dest_rel}" ]] && git -C "${REPO}" add -- "${dest_rel}"
 done
 
+# Commits HEAD has that origin/<branch> lacks. Local refs only, no fetch.
+# Prints 0 if there is nothing to compare.
+_unpushed_count() {
+  local b
+  b="$(git -C "${REPO}" symbolic-ref --quiet --short HEAD)" || { echo 0; return; }
+  git -C "${REPO}" rev-parse --verify --quiet "refs/remotes/origin/${b}" >/dev/null || { echo 0; return; }
+  git -C "${REPO}" rev-list --count "origin/${b}..HEAD"
+}
+
 if git -C "${REPO}" diff --cached --quiet; then
-  log "no content change; nothing to commit"
-  exit 0
+  # A failed push used to wait until a config file changed again; retry it.
+  unpushed="$(_unpushed_count)"
+  if [[ "${unpushed}" -eq 0 ]]; then
+    log "no content change; nothing to commit"
+    exit 0
+  fi
+  log "no content change; ${unpushed} unpushed commit(s), retrying push"
+else
+  changed="$(git -C "${REPO}" diff --cached --name-only | tr '\n' ' ' | sed 's/ $//')"
+  stat_line="$(git -C "${REPO}" diff --cached --shortstat | sed 's/^ *//')"
+
+  captured_at="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  git -C "${REPO}" commit --quiet \
+    -m "auto: ${changed} (${stat_line})" \
+    -m "Captured ${captured_at} by claude-config-backup.sh"
+  log "committed: ${changed} — ${stat_line}"
 fi
 
-changed="$(git -C "${REPO}" diff --cached --name-only | tr '\n' ' ' | sed 's/ $//')"
-stat_line="$(git -C "${REPO}" diff --cached --shortstat | sed 's/^ *//')"
+# Push. Unattended, so no prompts. Errors are logged, not discarded.
+# A "behind" rejection rebases once. Never force-push or reset.
 
-captured_at="$(date '+%Y-%m-%d %H:%M:%S %Z')"
-git -C "${REPO}" commit --quiet \
-  -m "auto: ${changed} (${stat_line})" \
-  -m "Captured ${captured_at} by claude-config-backup.sh"
-log "committed: ${changed} — ${stat_line}"
+# First line of git's stderr that says what went wrong, for the log. URL
+# userinfo (user:token@) is stripped in case a remote URL carries it.
+_git_error_excerpt() {
+  local err="$1" line
+  line="$(printf '%s\n' "${err}" | grep -m1 -E '^[[:space:]]*(!|error:|fatal:)' || true)"
+  if [[ -z "${line}" ]]; then
+    line="$(printf '%s\n' "${err}" | grep -m1 -v '^[[:space:]]*$' || true)"
+  fi
+  line="$(printf '%s' "${line}" | sed -E 's#(://)[^/@[:space:]]+@#\1#g; s/^[[:space:]]+//')"
+  printf '%s' "${line:-no error output from git}"
+}
+
+# True if the remote has commits we lack. Matches the [rejected] line;
+# advice.* config can hide the hint lines.
+_push_was_rejected_behind() {
+  printf '%s\n' "$1" | grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)'
+}
+
+# --absolute-git-dir: --git-path is relative to REPO, not to our cwd.
+_rebase_in_progress() {
+  local git_dir
+  git_dir="$(git -C "${REPO}" rev-parse --absolute-git-dir)" || return 1
+  [[ -d "${git_dir}/rebase-merge" || -d "${git_dir}/rebase-apply" ]]
+}
+
+# Prints git's stderr (stdout is discarded) and returns git's status.
+_push_head() {
+  { GIT_TERMINAL_PROMPT=0 git -C "${REPO}" push --quiet origin HEAD >/dev/null; } 2>&1
+}
+
+# Prints stdout and stderr both: git reports "CONFLICT (content): Merge
+# conflict in <path>" on stdout, and that line names the file to fix.
+_pull_rebase() {
+  GIT_TERMINAL_PROMPT=0 git -C "${REPO}" pull --rebase --quiet origin "$1" 2>&1
+}
 
 if git -C "${REPO}" remote get-url origin >/dev/null 2>&1; then
-  if git -C "${REPO}" push --quiet origin HEAD 2>/dev/null; then
+  if push_err="$(_push_head)"; then
     log "pushed to origin"
+  elif ! _push_was_rejected_behind "${push_err}"; then
+    excerpt="$(_git_error_excerpt "${push_err}")"
+    log "WARN: push failed (${excerpt}); commit is safe locally, will retry next run"
+  elif ! branch="$(git -C "${REPO}" symbolic-ref --quiet --short HEAD)"; then
+    log "WARN: push rejected, remote has commits we lack, but HEAD is detached so there is no branch to rebase; commit is safe locally"
   else
-    log "WARN: push failed; commit is safe locally, will retry next run"
+    log "push rejected, remote has commits we lack; rebasing onto origin/${branch}"
+    if pull_err="$(_pull_rebase "${branch}")"; then
+      if push_err="$(_push_head)"; then
+        log "pushed to origin after rebase"
+      else
+        excerpt="$(_git_error_excerpt "${push_err}")"
+        log "WARN: push after rebase failed (${excerpt}); commit is safe locally, will retry next run"
+      fi
+    elif _rebase_in_progress; then
+      # Name the conflicting file if git said which; else git's first error.
+      excerpt="$(printf '%s\n' "${pull_err}" | grep -m1 '^CONFLICT' || true)"
+      if [[ -z "${excerpt}" ]]; then
+        excerpt="$(_git_error_excerpt "${pull_err}")"
+      fi
+      if git -C "${REPO}" rebase --abort >/dev/null 2>&1; then
+        log "ERROR: rebase onto origin/${branch} conflicted (${excerpt}); rebase aborted, local commits are intact and unpushed"
+      else
+        log "ERROR: rebase onto origin/${branch} conflicted (${excerpt}) and 'git rebase --abort' also failed; inspect ${REPO} by hand"
+      fi
+      log "  Fix by hand: git -C '${REPO}' pull --rebase origin ${branch}, resolve the conflict, git rebase --continue, then git push origin ${branch}"
+      exit 1
+    else
+      excerpt="$(_git_error_excerpt "${pull_err}")"
+      log "WARN: pull --rebase failed (${excerpt}); commit is safe locally, will retry next run"
+    fi
   fi
 else
   log "no origin remote configured; commit is local only"
