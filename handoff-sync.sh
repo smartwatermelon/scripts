@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Two-way sync of ~/.local/state/claude-handoffs with Drive "Claude Handoff". TILSIT cron, every 5 min: no GUI there for a LaunchAgent.
 
-# Auth errors in the log: rclone's shared client_id is likely retired. Fix with: rclone config reconnect gdrive:
+# gdrive: has our own client, full drive scope (drive.file hides other Macs' files). Auth errors: rclone config reconnect gdrive:
 
 # Full path, not command -v: cron's PATH lacks /opt/homebrew/bin. Tests stub it; empty or non-executable = missing.
 RCLONE_BIN="${RCLONE_BIN:-/opt/homebrew/bin/rclone}"
